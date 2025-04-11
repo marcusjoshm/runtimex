@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link as RouterLink } from 'react-router-dom';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { 
   Box, 
   Button, 
@@ -20,7 +20,16 @@ import {
 import AddIcon from '@mui/icons-material/Add';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import EditIcon from '@mui/icons-material/Edit';
+import WatchIcon from '@mui/icons-material/Watch';
+import ShareIcon from '@mui/icons-material/Share';
+import CloudUploadIcon from '@mui/icons-material/CloudUpload';
+import CloudDownloadIcon from '@mui/icons-material/CloudDownload';
+import BookmarkIcon from '@mui/icons-material/Bookmark';
 import apiClient, { Experiment } from '../api/client';
+import ShareExperimentDialog from '../components/ShareExperimentDialog';
+import authClient, { User } from '../api/auth';
+import ImportExperimentDialog from '../components/ImportExperimentDialog';
+import TemplatesDialog from '../components/TemplatesDialog';
 
 const Home: React.FC = () => {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
@@ -29,41 +38,46 @@ const Home: React.FC = () => {
   const [openNewDialog, setOpenNewDialog] = useState(false);
   const [newExperimentName, setNewExperimentName] = useState('');
   const [newExperimentDesc, setNewExperimentDesc] = useState('');
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [shareExperimentId, setShareExperimentId] = useState('');
+  const [shareExperimentName, setShareExperimentName] = useState('');
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [templatesDialogOpen, setTemplatesDialogOpen] = useState(false);
+  const navigate = useNavigate();
 
   // Load experiments from API
   useEffect(() => {
     const fetchExperiments = async () => {
+      setLoading(true);
+      
       try {
-        setLoading(true);
-        const data = await apiClient.getExperiments();
+        // If user is logged in, get their experiments. Otherwise, get all experiments.
+        const data = currentUser 
+          ? await apiClient.getUserExperiments()
+          : await apiClient.getExperiments();
+        
         setExperiments(data);
         setError(null);
       } catch (err) {
         console.error('Failed to fetch experiments:', err);
         setError('Failed to load experiments. Please try again later.');
-        // Fall back to mock data in development
-        if (process.env.NODE_ENV === 'development') {
-          setExperiments([
-            {
-              id: '1',
-              name: 'Cell Culture Protocol',
-              description: 'Standard protocol for maintaining cell cultures',
-              steps: []
-            },
-            {
-              id: '2',
-              name: 'Western Blot',
-              description: 'Western blotting for protein detection',
-              steps: []
-            }
-          ]);
-        }
       } finally {
         setLoading(false);
       }
     };
     
     fetchExperiments();
+  }, [currentUser]);
+
+  // Check auth state on load
+  useEffect(() => {
+    const checkAuth = async () => {
+      const user = await authClient.getCurrentUser();
+      setCurrentUser(user);
+    };
+    
+    checkAuth();
   }, []);
 
   const handleCreateNewExperiment = async () => {
@@ -84,6 +98,32 @@ const Home: React.FC = () => {
     }
   };
 
+  // Add function to handle share button click
+  const handleShareClick = (experiment: Experiment) => {
+    setShareExperimentId(experiment.id);
+    setShareExperimentName(experiment.name);
+    setShareDialogOpen(true);
+  };
+
+  // Add handler for export
+  const handleExportExperiment = (experimentId: string) => {
+    apiClient.exportExperiment(experimentId);
+  };
+
+  // Add handler for template creation
+  const handleCreateTemplate = async (experimentId: string, experimentName: string) => {
+    try {
+      const templateName = window.prompt('Enter a name for this template:', experimentName);
+      if (!templateName) return; // User cancelled
+      
+      await apiClient.createTemplate(experimentId, templateName);
+      alert('Template created successfully!');
+    } catch (err: any) {
+      console.error('Failed to create template:', err);
+      alert('Failed to create template. Please try again.');
+    }
+  };
+
   return (
     <Container maxWidth="lg">
       <Box sx={{ my: 4 }}>
@@ -91,13 +131,35 @@ const Home: React.FC = () => {
           <Typography variant="h4" component="h1" gutterBottom>
             My Experiments
           </Typography>
-          <Fab 
-            color="primary" 
-            aria-label="add"
-            onClick={() => setOpenNewDialog(true)}
-          >
-            <AddIcon />
-          </Fab>
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 3 }}>
+            {currentUser && (
+              <>
+                <Button
+                  variant="outlined"
+                  startIcon={<CloudUploadIcon />}
+                  onClick={() => setImportDialogOpen(true)}
+                  sx={{ mr: 2 }}
+                >
+                  Import
+                </Button>
+                <Button
+                  variant="outlined"
+                  startIcon={<BookmarkIcon />}
+                  onClick={() => setTemplatesDialogOpen(true)}
+                  sx={{ mr: 2 }}
+                >
+                  Templates
+                </Button>
+              </>
+            )}
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={() => navigate('/design')}
+            >
+              New Experiment
+            </Button>
+          </Box>
         </Box>
       
         {loading ? (
@@ -148,6 +210,42 @@ const Home: React.FC = () => {
                     >
                       Run
                     </Button>
+                    {currentUser && experiment.owner === currentUser.username && (
+                      <Button
+                        size="small"
+                        color="secondary"
+                        onClick={() => handleShareClick(experiment)}
+                        startIcon={<ShareIcon />}
+                      >
+                        Share
+                      </Button>
+                    )}
+                    {currentUser && experiment.owner === currentUser.username && (
+                      <Button
+                        size="small"
+                        onClick={() => handleExportExperiment(experiment.id)}
+                        startIcon={<CloudDownloadIcon />}
+                      >
+                        Export
+                      </Button>
+                    )}
+                    {currentUser && experiment.owner === currentUser.username && (
+                      <Button
+                        size="small"
+                        onClick={() => handleCreateTemplate(experiment.id, experiment.name)}
+                        startIcon={<BookmarkIcon />}
+                      >
+                        Save as Template
+                      </Button>
+                    )}
+                    <Button
+                      size="small"
+                      color="secondary"
+                      onClick={() => navigate(`/watch/${experiment.id}`)}
+                      startIcon={<WatchIcon />}
+                    >
+                      Watch View
+                    </Button>
                   </CardActions>
                 </Card>
               </Grid>
@@ -195,6 +293,35 @@ const Home: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Share Experiment Dialog */}
+      {shareDialogOpen && (
+        <ShareExperimentDialog
+          open={shareDialogOpen}
+          onClose={() => setShareDialogOpen(false)}
+          experimentId={shareExperimentId}
+          experimentName={shareExperimentName}
+        />
+      )}
+
+      {importDialogOpen && (
+        <ImportExperimentDialog
+          open={importDialogOpen}
+          onClose={() => setImportDialogOpen(false)}
+          onImportSuccess={fetchExperiments}
+        />
+      )}
+
+      {templatesDialogOpen && (
+        <TemplatesDialog
+          open={templatesDialogOpen}
+          onClose={() => setTemplatesDialogOpen(false)}
+          onTemplateSelected={(experiment) => {
+            fetchExperiments();
+            navigate(`/design?id=${experiment.id}`);
+          }}
+        />
+      )}
     </Container>
   );
 };

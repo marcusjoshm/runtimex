@@ -24,6 +24,8 @@ export interface Experiment {
   name: string;
   description: string;
   steps: Step[];
+  owner?: string;
+  sharedWith?: Record<string, string>; // username -> permission
 }
 
 // Create API client
@@ -62,6 +64,55 @@ const apiClient = {
   
   completeStep: async (stepId: string): Promise<Experiment> => {
     const response = await axios.post(`${API_URL}/steps/${stepId}/complete`);
+    return response.data;
+  },
+
+  getUserExperiments: async (): Promise<Experiment[]> => {
+    const response = await axios.get(`${API_URL}/user/experiments`);
+    return response.data;
+  },
+
+  // Export experiment
+  exportExperiment: async (experimentId: string): Promise<void> => {
+    // This will trigger a file download
+    window.location.href = `${API_URL}/experiments/${experimentId}/export`;
+  },
+
+  // Import experiment
+  importExperiment: async (file: File): Promise<Experiment> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    const response = await axios.post(`${API_URL}/experiments/import`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data'
+      }
+    });
+    return response.data;
+  },
+
+  // Template management
+  getTemplates: async (): Promise<any[]> => {
+    const response = await axios.get(`${API_URL}/templates`);
+    return response.data;
+  },
+
+  createTemplate: async (experimentId: string, name: string): Promise<any> => {
+    const response = await axios.post(`${API_URL}/templates`, {
+      experimentId,
+      name
+    });
+    return response.data;
+  },
+
+  deleteTemplate: async (templateId: string): Promise<void> => {
+    await axios.delete(`${API_URL}/templates/${templateId}`);
+  },
+
+  createFromTemplate: async (templateId: string, name?: string): Promise<Experiment> => {
+    const response = await axios.post(`${API_URL}/experiments/create-from-template/${templateId}`, {
+      name
+    });
     return response.data;
   }
 };

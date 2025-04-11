@@ -33,6 +33,7 @@ import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ErrorIcon from '@mui/icons-material/Error';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
 import apiClient, { Experiment, Step } from '../api/client';
+import socketService from '../api/socket';
 
 // Maps to match backend enum values
 const StepStatus = {
@@ -65,6 +66,42 @@ const ExperimentRunner: React.FC = () => {
   const [conflicts, setConflicts] = useState<{ step1: Step, step2: Step }[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+
+  // Initialize socket connection
+  useEffect(() => {
+    // Initialize the socket connection
+    socketService.initializeSocket();
+    
+    // Clean up on unmount
+    return () => {
+      socketService.disconnectSocket();
+    };
+  }, []);
+
+  // Subscribe to experiment updates
+  useEffect(() => {
+    if (!experimentId) return;
+    
+    // Start receiving updates for this experiment
+    socketService.startExperimentUpdates(experimentId);
+    
+    // Register handler for experiment updates
+    const unsubscribe = socketService.onExperimentUpdate((updatedExperiment) => {
+      // Only update if it's the current experiment
+      if (updatedExperiment.id === experimentId) {
+        setExperiment(updatedExperiment);
+        
+        // Update active step index if needed
+        const readyStepIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
+        if (readyStepIndex !== -1 && activeStepIndex === null) {
+          setActiveStepIndex(readyStepIndex);
+        }
+      }
+    });
+    
+    // Clean up subscription
+    return unsubscribe;
+  }, [experimentId, activeStepIndex]);
 
   // Fetch experiment data
   useEffect(() => {

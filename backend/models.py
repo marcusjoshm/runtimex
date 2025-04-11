@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Optional, Dict, Any
+import bcrypt
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -156,3 +157,24 @@ class Experiment:
         return f"Experiment(id={self.id}, name='{self.name}', num_steps={len(self.steps)})"
 
 # Later, we'll add a Scheduler class to manage multiple Experiments and their Steps 
+
+class User:
+    def __init__(self, username: str, email: str, password: str):
+        self.id: str = str(uuid.uuid4())
+        self.username: str = username
+        self.email: str = email
+        self.password_hash: str = self._hash_password(password)
+        self.shared_experiments: Dict[str, str] = {}  # experiment_id -> permission
+    
+    def _hash_password(self, password: str) -> str:
+        # Generate a salted hash of the password
+        password_bytes = password.encode('utf-8')
+        salt = bcrypt.gensalt()
+        hashed = bcrypt.hashpw(password_bytes, salt)
+        return hashed.decode('utf-8')
+    
+    def check_password(self, password: str) -> bool:
+        # Check if the provided password matches the stored hash
+        password_bytes = password.encode('utf-8')
+        hashed_bytes = self.password_hash.encode('utf-8')
+        return bcrypt.checkpw(password_bytes, hashed_bytes) 

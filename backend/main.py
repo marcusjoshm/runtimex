@@ -2,17 +2,39 @@ from datetime import datetime, timedelta
 import time # For simulating delays (optional)
 import json
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
+import uuid
 
 from models import Experiment, Step, StepStatus, StepType
 from scheduler import Scheduler
+import auth
+
+# Import notification system
+from notifications import NotificationService, Notification, NotificationType, NotificationPriority, ActionType, NotificationAction, create_notification_factories
 
 app = Flask(__name__)
 CORS(app)
 
 # Global scheduler instance to maintain state
 scheduler = Scheduler()
+
+# Add after app creation
+app.config["JWT_SECRET_KEY"] = "your-secret-key-change-in-production"
+jwt = JWTManager(app)
+
+# Initialize auth routes and get the user getter function
+get_user = auth.register_auth_routes(app, jwt)
+
+# Update the scheduler to track experiment ownership
+scheduler.user_experiments = {}  # username -> [experiment_ids]
+
+# Initialize notification service with socketio
+notification_service = NotificationService(socketio)
+
+# Create notification factories
+notification_factories = create_notification_factories(scheduler)
 
 # --- Define Helper Function to Print Schedule --- 
 def print_schedule(scheduler: Scheduler):
@@ -61,12 +83,19 @@ def experiment_to_dict(experiment):
             
         steps.append(step_dict)
         
-    return {
+    result = {
         'id': experiment.id,
         'name': experiment.name,
         'description': experiment.description,
         'steps': steps
     }
+    
+    # Add ownership information if available
+    if hasattr(experiment, 'owner'):
+        result['owner'] = experiment.owner
+        result['sharedWith'] = experiment.shared_with
+    
+    return result
 
 # --- API Routes ---
 
@@ -86,14 +115,20 @@ def get_experiment(experiment_id):
     return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/experiments', methods=['POST'])
+@jwt_required()
 def create_experiment():
     # Create a new experiment
     data = request.json
+    username = get_jwt_identity()
     
     experiment = Experiment(
         name=data['name'],
         description=data.get('description', '')
     )
+    
+    # Add ownership information
+    experiment.owner = username
+    experiment.shared_with = {}  # username -> permission
     
     for step_data in data.get('steps', []):
         duration_minutes = int(step_data.get('duration', 0))
@@ -108,6 +143,11 @@ def create_experiment():
         experiment.add_step(step)
     
     scheduler.add_experiment(experiment)
+    
+    # Track experiment ownership
+    if username not in scheduler.user_experiments:
+        scheduler.user_experiments[username] = []
+    scheduler.user_experiments[username].append(experiment.id)
     
     if experiment.steps:
         start_time = datetime.now()
@@ -213,6 +253,432 @@ def complete_step(step_id):
         return jsonify(experiment_to_dict(experiment))
     else:
         return jsonify({'error': 'Experiment not found for step'}), 500
+
+# Add a route to get user's experiments
+@app.route('/api/user/experiments', methods=['GET'])
+@jwt_required()
+def get_user_experiments():
+    username = get_jwt_identity()
+    
+    # Get experiments owned by user
+    user_experiment_ids = scheduler.user_experiments.get(username, [])
+    experiments = []
+    
+    for exp_id in user_experiment_ids:
+        if exp_id in scheduler.experiments:
+            experiments.append(experiment_to_dict(scheduler.experiments[exp_id]))
+    
+    # Get experiments shared with user
+    user = get_user(username)
+    if user:
+        for exp_id in user.shared_experiments:
+            if exp_id in scheduler.experiments:
+                experiments.append(experiment_to_dict(scheduler.experiments[exp_id]))
+    
+    return jsonify(experiments)
+
+# Add route to share an experiment
+@app.route('/api/experiments/<experiment_id>/share', methods=['POST'])
+@jwt_required()
+def share_experiment(experiment_id):
+    username = get_jwt_identity()
+    data = request.json
+    share_with_username = data.get('username')
+    permission = data.get('permission', 'view')  # 'view' or 'edit'
+    
+    # Validate input
+    if not share_with_username:
+        return jsonify({"error": "Username to share with is required"}), 400
+    
+    if permission not in ['view', 'edit']:
+        return jsonify({"error": "Permission must be 'view' or 'edit'"}), 400
+    
+    # Get experiment
+    experiment = scheduler.experiments.get(experiment_id)
+    if not experiment:
+        return jsonify({"error": "Experiment not found"}), 404
+    
+    # Check if user is the owner
+    if getattr(experiment, 'owner', None) != username:
+        return jsonify({"error": "Only the owner can share this experiment"}), 403
+    
+    # Get user to share with
+    share_with_user = get_user(share_with_username)
+    if not share_with_user:
+        return jsonify({"error": "User to share with not found"}), 404
+    
+    # Share the experiment
+    experiment.shared_with[share_with_username] = permission
+    share_with_user.shared_experiments[experiment_id] = permission
+    
+    return jsonify({"message": f"Experiment shared with {share_with_username}"}), 200
+
+# Add export experiment endpoint
+@app.route('/api/experiments/<experiment_id>/export', methods=['GET'])
+@jwt_required(optional=True)  # Make auth optional so non-logged-in users can still export
+def export_experiment(experiment_id):
+    # Get experiment
+    experiment = scheduler.experiments.get(experiment_id)
+    if not experiment:
+        return jsonify({"error": "Experiment not found"}), 404
+    
+    # Convert to exportable format (strip user-specific data)
+    export_data = experiment_to_dict(experiment)
+    
+    # Remove owner and sharing info for privacy
+    if 'owner' in export_data:
+        del export_data['owner']
+    if 'sharedWith' in export_data:
+        del export_data['sharedWith']
+    
+    # Create a temporary file
+    fd, path = tempfile.mkstemp(suffix='.json')
+    try:
+        with os.fdopen(fd, 'w') as tmp:
+            json.dump(export_data, tmp, indent=2)
+        
+        # Return the file as an attachment
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=f"{experiment.name.replace(' ', '_')}_export.json",
+            mimetype='application/json'
+        )
+    except Exception as e:
+        return jsonify({"error": f"Export failed: {str(e)}"}), 500
+    finally:
+        # Ensure the temp file is removed after response
+        try:
+            os.remove(path)
+        except:
+            pass
+
+# Add import experiment endpoint
+@app.route('/api/experiments/import', methods=['POST'])
+@jwt_required()
+def import_experiment():
+    username = get_jwt_identity()
+    
+    # Check if file was uploaded
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    
+    if not file.filename.endswith('.json'):
+        return jsonify({"error": "Only JSON files are supported"}), 400
+    
+    try:
+        # Parse the file
+        data = json.load(file)
+        
+        # Basic validation
+        required_fields = ['name', 'steps']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"Invalid experiment format: missing '{field}'"}), 400
+        
+        # Create a new experiment
+        experiment = Experiment(
+            name=data['name'],
+            description=data.get('description', '')
+        )
+        
+        # Add ownership information
+        experiment.owner = username
+        experiment.shared_with = {}
+        
+        # Add steps
+        for step_data in data.get('steps', []):
+            # Ensure step has required fields
+            if 'name' not in step_data or 'type' not in step_data or 'duration' not in step_data:
+                continue
+            
+            duration_minutes = int(step_data.get('duration', 0))
+            step = Step(
+                name=step_data['name'],
+                duration=timedelta(minutes=duration_minutes),
+                step_type=StepType(step_data.get('type', 'fixed_duration')),
+                dependencies=step_data.get('dependencies', []),
+                notes=step_data.get('notes', ''),
+                resource_needed=step_data.get('resourceNeeded', '')
+            )
+            experiment.add_step(step)
+        
+        # Add to scheduler
+        scheduler.add_experiment(experiment)
+        
+        # Track experiment ownership
+        if username not in scheduler.user_experiments:
+            scheduler.user_experiments[username] = []
+        scheduler.user_experiments[username].append(experiment.id)
+        
+        # Calculate initial schedule
+        if experiment.steps:
+            start_time = datetime.now()
+            scheduler.calculate_initial_schedule(start_time=start_time)
+        
+        return jsonify(experiment_to_dict(experiment)), 201
+        
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid JSON file"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Import failed: {str(e)}"}), 500
+
+# Add template management endpoints
+@app.route('/api/templates', methods=['GET'])
+@jwt_required()
+def get_templates():
+    username = get_jwt_identity()
+    
+    # In a real app, templates would be stored in a database
+    # For now, we'll use a simple in-memory store
+    if not hasattr(scheduler, 'templates'):
+        scheduler.templates = {}
+    
+    # Get templates for the user
+    user_templates = scheduler.templates.get(username, [])
+    return jsonify(user_templates)
+
+@app.route('/api/templates', methods=['POST'])
+@jwt_required()
+def create_template():
+    username = get_jwt_identity()
+    data = request.json
+    
+    # Validate input
+    if 'experimentId' not in data or 'name' not in data:
+        return jsonify({"error": "Experiment ID and template name are required"}), 400
+    
+    experiment_id = data['experimentId']
+    template_name = data['name']
+    
+    # Get experiment
+    experiment = scheduler.experiments.get(experiment_id)
+    if not experiment:
+        return jsonify({"error": "Experiment not found"}), 404
+    
+    # Check ownership (only owner can create templates)
+    if getattr(experiment, 'owner', None) != username:
+        return jsonify({"error": "Only the owner can create templates from this experiment"}), 403
+    
+    # Create template data (simplified experiment)
+    template_data = {
+        'id': str(uuid.uuid4()),
+        'name': template_name,
+        'source_experiment_id': experiment_id,
+        'created_at': datetime.now().isoformat(),
+        'steps': []
+    }
+    
+    # Add steps (without status/timing info)
+    for step_id, step in experiment.steps.items():
+        template_data['steps'].append({
+            'name': step.name,
+            'type': step.step_type.value,
+            'duration': step.duration.total_seconds() // 60,
+            'dependencies': step.dependencies,
+            'notes': step.notes,
+            'resourceNeeded': step.resource_needed
+        })
+    
+    # Store template
+    if not hasattr(scheduler, 'templates'):
+        scheduler.templates = {}
+    
+    if username not in scheduler.templates:
+        scheduler.templates[username] = []
+    
+    scheduler.templates[username].append(template_data)
+    
+    return jsonify(template_data), 201
+
+@app.route('/api/templates/<template_id>', methods=['DELETE'])
+@jwt_required()
+def delete_template(template_id):
+    username = get_jwt_identity()
+    
+    # Check if templates exist
+    if not hasattr(scheduler, 'templates') or username not in scheduler.templates:
+        return jsonify({"error": "Template not found"}), 404
+    
+    # Find and remove template
+    for i, template in enumerate(scheduler.templates[username]):
+        if template['id'] == template_id:
+            del scheduler.templates[username][i]
+            return jsonify({"message": "Template deleted"}), 200
+    
+    return jsonify({"error": "Template not found"}), 404
+
+@app.route('/api/experiments/create-from-template/<template_id>', methods=['POST'])
+@jwt_required()
+def create_from_template(template_id):
+    username = get_jwt_identity()
+    
+    # Check if templates exist
+    if not hasattr(scheduler, 'templates') or username not in scheduler.templates:
+        return jsonify({"error": "Template not found"}), 404
+    
+    # Find template
+    template = None
+    for t in scheduler.templates[username]:
+        if t['id'] == template_id:
+            template = t
+            break
+    
+    if not template:
+        return jsonify({"error": "Template not found"}), 404
+    
+    # Get experiment name from request or use template name
+    data = request.json or {}
+    name = data.get('name', f"{template['name']} - Copy")
+    
+    # Create a new experiment
+    experiment = Experiment(
+        name=name,
+        description=data.get('description', '')
+    )
+    
+    # Add ownership information
+    experiment.owner = username
+    experiment.shared_with = {}
+    
+    # Add steps from template
+    for step_data in template['steps']:
+        duration_minutes = int(step_data.get('duration', 0))
+        step = Step(
+            name=step_data['name'],
+            duration=timedelta(minutes=duration_minutes),
+            step_type=StepType(step_data.get('type', 'fixed_duration')),
+            dependencies=step_data.get('dependencies', []),
+            notes=step_data.get('notes', ''),
+            resource_needed=step_data.get('resourceNeeded', '')
+        )
+        experiment.add_step(step)
+    
+    # Add to scheduler
+    scheduler.add_experiment(experiment)
+    
+    # Track experiment ownership
+    if username not in scheduler.user_experiments:
+        scheduler.user_experiments[username] = []
+    scheduler.user_experiments[username].append(experiment.id)
+    
+    # Calculate initial schedule
+    if experiment.steps:
+        start_time = datetime.now()
+        scheduler.calculate_initial_schedule(start_time=start_time)
+    
+    return jsonify(experiment_to_dict(experiment)), 201
+
+# Add notification routes
+@app.route('/api/notifications', methods=['GET'])
+@jwt_required()
+def get_notifications():
+    username = get_jwt_identity()
+    unread_only = request.args.get('unread_only', 'false').lower() == 'true'
+    
+    notifications = notification_service.get_user_notifications(username, unread_only)
+    return jsonify([n.to_dict() for n in notifications])
+
+@app.route('/api/notifications/<notification_id>/read', methods=['POST'])
+@jwt_required()
+def mark_notification_read(notification_id):
+    notification_service.mark_as_read(notification_id)
+    return jsonify({"message": "Notification marked as read"})
+
+@app.route('/api/notifications/<notification_id>/dismiss', methods=['POST'])
+@jwt_required()
+def dismiss_notification(notification_id):
+    notification_service.mark_as_dismissed(notification_id)
+    return jsonify({"message": "Notification dismissed"})
+
+@app.route('/api/notifications/<notification_id>', methods=['DELETE'])
+@jwt_required()
+def delete_notification(notification_id):
+    success = notification_service.delete_notification(notification_id)
+    if success:
+        return jsonify({"message": "Notification deleted"})
+    else:
+        return jsonify({"error": "Notification not found"}), 404
+
+# WebSocket event handlers for notifications
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    
+    # Add user to their own room for targeted notifications
+    user = get_jwt_identity() if request.args.get('token') else None
+    if user:
+        join_room(f'user_{user}')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+# Update existing handlers to trigger notifications
+
+# Modify handle_step_start to send notifications
+def handle_step_start(step_id, start_time=None):
+    # Existing step start logic...
+    
+    # Send notification for next ready step
+    for step in scheduler.schedule.values():
+        if step.status == StepStatus.READY:
+            # Find the experiment for this step
+            for exp in scheduler.experiments.values():
+                if step.id in exp.steps:
+                    notification = notification_factories["step_ready"](step, exp)
+                    notification_service.create_notification(notification)
+                    break
+
+# Modify handle_step_complete to send notifications
+def handle_step_complete(step_id, end_time=None):
+    # Get the step before completing it
+    step = scheduler.get_step(step_id)
+    
+    # Find the experiment
+    experiment = None
+    for exp in scheduler.experiments.values():
+        if step_id in exp.steps:
+            experiment = exp
+            break
+    
+    # Complete the step
+    # Existing step complete logic...
+    
+    # Send completion notification
+    if experiment:
+        notification = notification_factories["step_completed"](step, experiment)
+        notification_service.create_notification(notification)
+    
+    # Check for resource conflicts in newly ready steps
+    check_resource_conflicts()
+
+# Add resource conflict detection
+def check_resource_conflicts():
+    running_resources = {}  # resource -> step
+    
+    # Find all running steps and their resources
+    for step in scheduler.schedule.values():
+        if step.status == StepStatus.RUNNING and step.resource_needed:
+            if step.resource_needed in running_resources:
+                # Conflict detected!
+                conflicting_step = running_resources[step.resource_needed]
+                
+                # Find the experiment
+                for exp in scheduler.experiments.values():
+                    if step.id in exp.steps or conflicting_step.id in exp.steps:
+                        experiment = exp
+                        notification = notification_factories["resource_conflict"](
+                            step, conflicting_step, experiment, step.resource_needed
+                        )
+                        notification_service.create_notification(notification)
+                        break
+            else:
+                running_resources[step.resource_needed] = step
 
 # --- Main Test Function --- 
 def run_test():
