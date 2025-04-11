@@ -4,7 +4,7 @@ A flexible scheduling application for managing complex, multi-step processes lik
 
 ## About the Name
 
-runtimex is a play on "runtime" (the execution time of a program) and "Timex" (the classic watch brand). As a former runner, this project aims to create the ideal timing tool I've always wanted - something that could manage complex, overlapping timing scenarios better than a traditional stopwatch.
+runtimex is a play on "runtime" (the execution time of a program) and "Timex" (the classic watch brand). As a former running, I always wore a Timex watch. I used it for everything. It worked perfectly fine: a clock, a stopwatch with laps, a timer, an alarm. Now I need something more. runtimex is the last timer you'll ever need.
 
 ## Features
 
