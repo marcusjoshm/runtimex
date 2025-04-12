@@ -1,6 +1,6 @@
 # runtimex
 
-A flexible scheduling application for managing complex, multi-step processes like lab experiments or training routines. runtimex helps manage timing conflicts between different steps and resources, allowing users to efficiently multitask during time-sensitive activities.
+A flexible scheduling application for managing complex, multi-step processes like lab experiments or training routines. runtimex helps manage timing conflicts between different steps and resources, allowing users to efficiently multitask during time-sensitive activities. Under construction...
 
 ## About the Name
 
