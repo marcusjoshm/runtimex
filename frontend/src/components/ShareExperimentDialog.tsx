@@ -14,7 +14,7 @@ import {
   Box,
   Alert
 } from '@mui/material';
-import authClient from '../api/auth';
+import apiClient from '../api/client';
 
 interface ShareExperimentDialogProps {
   open: boolean;
@@ -46,7 +46,7 @@ const ShareExperimentDialog: React.FC<ShareExperimentDialogProps> = ({
       setError(null);
       setSuccess(false);
       
-      await authClient.shareExperiment(experimentId, username, permission);
+      await apiClient.shareExperiment(experimentId, username, permission);
       setSuccess(true);
       setUsername('');
     } catch (err: any) {

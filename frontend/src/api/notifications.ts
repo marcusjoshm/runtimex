@@ -2,7 +2,7 @@ import axios from 'axios';
 import { io, Socket } from 'socket.io-client';
 import authClient from './auth';
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'http://localhost:5001/api';
 
 // Notification types
 export enum NotificationType {
@@ -90,7 +90,7 @@ class NotificationService {
       }
       
       // Create new socket connection with auth token
-      this.socket = io('http://localhost:5000', {
+      this.socket = io('http://localhost:5001', {
         query: { token }
       });
       

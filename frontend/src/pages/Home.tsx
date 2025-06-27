@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { 
   Box, 
@@ -9,7 +9,6 @@ import {
   Container, 
   Grid, 
   Typography,
-  Fab,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -46,29 +45,30 @@ const Home: React.FC = () => {
   const [templatesDialogOpen, setTemplatesDialogOpen] = useState(false);
   const navigate = useNavigate();
 
+  // Function to fetch experiments from API
+  const fetchExperiments = useCallback(async () => {
+    setLoading(true);
+    
+    try {
+      // If user is logged in, get their experiments. Otherwise, get all experiments.
+      const data = currentUser 
+        ? await apiClient.getUserExperiments()
+        : await apiClient.getExperiments();
+      
+      setExperiments(data);
+      setError(null);
+    } catch (err) {
+      console.error('Failed to fetch experiments:', err);
+      setError('Failed to load experiments. Please try again later.');
+    } finally {
+      setLoading(false);
+    }
+  }, [currentUser]);
+
   // Load experiments from API
   useEffect(() => {
-    const fetchExperiments = async () => {
-      setLoading(true);
-      
-      try {
-        // If user is logged in, get their experiments. Otherwise, get all experiments.
-        const data = currentUser 
-          ? await apiClient.getUserExperiments()
-          : await apiClient.getExperiments();
-        
-        setExperiments(data);
-        setError(null);
-      } catch (err) {
-        console.error('Failed to fetch experiments:', err);
-        setError('Failed to load experiments. Please try again later.');
-      } finally {
-        setLoading(false);
-      }
-    };
-    
     fetchExperiments();
-  }, [currentUser]);
+  }, [fetchExperiments]);
 
   // Check auth state on load
   useEffect(() => {

@@ -45,4 +45,4 @@ node_modules/
 .vscode/
 *.swp
 *.swo
-.DS_Store 
+.DS_Store venv/

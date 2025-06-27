@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'http://localhost:5001/api';
 
 // Define interfaces to match backend models
 export interface Step {
@@ -114,6 +114,14 @@ const apiClient = {
       name
     });
     return response.data;
+  },
+
+  // Share experiment
+  shareExperiment: async (experimentId: string, username: string, permission: 'view' | 'edit'): Promise<void> => {
+    await axios.post(`${API_URL}/experiments/${experimentId}/share`, {
+      username,
+      permission
+    });
   }
 };
 

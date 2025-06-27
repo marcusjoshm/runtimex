@@ -50,7 +50,7 @@ trap cleanup SIGINT SIGTERM
 
 echo
 echo "runtimex is running!"
-echo "Backend API: http://localhost:5000/api"
+echo "Backend API: http://localhost:5001/api"
 echo "Frontend Web App: http://localhost:3000"
 echo
 echo "Press Ctrl+C to stop both servers"

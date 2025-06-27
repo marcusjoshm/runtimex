@@ -2,8 +2,10 @@ from datetime import datetime, timedelta
 import time # For simulating delays (optional)
 import json
 import os
+import tempfile
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, leave_room
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
 import uuid
 
@@ -16,6 +18,9 @@ from notifications import NotificationService, Notification, NotificationType, N
 
 app = Flask(__name__)
 CORS(app)
+
+# Initialize SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Global scheduler instance to maintain state
 scheduler = Scheduler()
@@ -783,5 +788,5 @@ if __name__ == "__main__":
     if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         run_test()
     
-    # Start the Flask app
-    app.run(debug=True, port=5000)
+    # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000
+    socketio.run(app, debug=True, port=5001, host='0.0.0.0')

@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'http://localhost:5001/api';
 
 export interface User {
   id: string;
@@ -48,4 +48,33 @@ const authClient = {
     
     return response.data;
   },
-}; 
+  
+  logout: () => {
+    localStorage.removeItem('token');
+    delete axios.defaults.headers.common['Authorization'];
+  },
+  
+  getCurrentUser: async (): Promise<User | null> => {
+    const token = localStorage.getItem('token');
+    if (!token) return null;
+    
+    try {
+      // Set auth header
+      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      
+      const response = await axios.get(`${API_URL}/auth/me`);
+      return response.data.user;
+    } catch (error) {
+      // Token might be invalid
+      localStorage.removeItem('token');
+      delete axios.defaults.headers.common['Authorization'];
+      return null;
+    }
+  },
+  
+  isAuthenticated: (): boolean => {
+    return !!localStorage.getItem('token');
+  }
+};
+
+export default authClient; 
