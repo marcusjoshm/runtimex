@@ -51,6 +51,7 @@ class Step:
         resource_needed: Optional[str] = None, # e.g., 'microscope', 'user_attention', 'oven'
         condition_id: Optional[str] = None, # The Condition this step belongs to. Required for persisted steps; nullable here so legacy callers that don't yet specify it still work in tests, but persistence enforces non-null.
         inherits_elapsed_from: Optional[str] = None, # U3 cascading time: the source Step's id, or the literal "previous". Resolution happens server-side in main.start_step before Step.start() runs (see backend/main.py). Default None = no inherit; the field is opt-in per-Step.
+        prewarning_offsets_seconds: Optional[List[int]] = None, # U4 pre-warnings: offsets BEFORE expected end at which the client should fire a "prewarning_hit" socket event. e.g. [600] = "warn me 10 minutes before this step ends". Server-side dedupe lives in ``prewarnings_fired``. Empty list / None = no pre-warnings.
     ):
         self.id: str = str(uuid.uuid4()) # Unique identifier for the step
         self.name: str = name
@@ -66,6 +67,17 @@ class Step:
         # ``elapsed_time`` from the source's final elapsed BEFORE start() runs.
         # See backend/main.py for the resolution rules.
         self.inherits_elapsed_from: Optional[str] = inherits_elapsed_from
+        # U4 pre-warnings. ``prewarning_offsets_seconds`` is configuration the
+        # user sets in the Designer (a list of "fire N seconds before expected
+        # end"); ``prewarnings_fired`` is server-tracked dedup state, NOT a
+        # constructor arg -- the server appends to it as offsets are delivered.
+        # Both round-trip via the ORM bridge so a process restart preserves
+        # which offsets have already fired (so the client doesn't re-emit them
+        # after a reconnect).
+        self.prewarning_offsets_seconds: List[int] = (
+            list(prewarning_offsets_seconds) if prewarning_offsets_seconds else []
+        )
+        self.prewarnings_fired: List[int] = []
 
         # Default resource needed based on type (can be overridden)
         if self.resource_needed is None:
@@ -523,6 +535,23 @@ class StepORM(db.Model):
     # is the only writer of seeded elapsed_seconds.
     inherits_elapsed_from = Column(String, nullable=True)
 
+    # U4 pre-warnings. Two JSON list columns:
+    # * ``prewarning_offsets_seconds`` -- user-configured offsets (seconds before
+    #   expected end) at which to fire a notification. Read by the client tick;
+    #   never written by the server.
+    # * ``prewarnings_fired`` -- server-tracked dedup state. The
+    #   ``prewarning_hit`` socket handler appends an offset here exactly once;
+    #   subsequent emits for the same offset are silent no-ops.
+    # Both default to ``list`` so SQLAlchemy emits ``[]`` on fresh rows.
+    # Nullable at the SQL level (matching ``condition_id``'s pattern) so raw
+    # SQL inserts that pre-date this column don't fail, AND so SQLite ALTER
+    # TABLE ADD COLUMN on legacy DBs works without a NOT NULL violation.
+    # ``apply_dataclass`` / ``to_dataclass`` defensively coerce NULL -> [] so
+    # downstream consumers see an empty list, never None. The migration in
+    # db._run_migrations() also backfills NULL -> '[]' for legacy rows.
+    prewarning_offsets_seconds = Column(JSON, nullable=True, default=list)
+    prewarnings_fired = Column(JSON, nullable=True, default=list)
+
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     experiment = relationship("ExperimentORM", back_populates="steps")
@@ -560,6 +589,15 @@ class StepORM(db.Model):
             earliest_possible_start_time=step.earliest_possible_start_time,
             latest_allowed_start_time=step.latest_allowed_start_time,
             inherits_elapsed_from=getattr(step, "inherits_elapsed_from", None),
+            # U4: round-trip both pre-warning columns. Defensive copies so a
+            # later mutation on the dataclass list doesn't accidentally aliase
+            # into the ORM row's JSON value.
+            prewarning_offsets_seconds=list(
+                getattr(step, "prewarning_offsets_seconds", []) or []
+            ),
+            prewarnings_fired=list(
+                getattr(step, "prewarnings_fired", []) or []
+            ),
         )
 
     def apply_dataclass(self, step: "Step") -> None:
@@ -591,6 +629,17 @@ class StepORM(db.Model):
         # Required so a server restart mid-run preserves the seeded elapsed
         # alongside the directive that caused the seed.
         self.inherits_elapsed_from = getattr(step, "inherits_elapsed_from", None)
+        # U4: persist both pre-warning fields. ``prewarning_offsets_seconds`` is
+        # config that flows from the Designer through PUT into the dataclass;
+        # ``prewarnings_fired`` is dedup state mutated only by the
+        # ``prewarning_hit`` SocketIO handler. Either path persists via this
+        # method (the SocketIO handler writes through scheduler._persist_step_state).
+        self.prewarning_offsets_seconds = list(
+            getattr(step, "prewarning_offsets_seconds", []) or []
+        )
+        self.prewarnings_fired = list(
+            getattr(step, "prewarnings_fired", []) or []
+        )
 
     def to_dataclass(self) -> "Step":
         step = Step.__new__(Step)
@@ -612,6 +661,12 @@ class StepORM(db.Model):
         step.earliest_possible_start_time = self.earliest_possible_start_time
         step.latest_allowed_start_time = self.latest_allowed_start_time
         step.inherits_elapsed_from = self.inherits_elapsed_from
+        # U4: hydrate both pre-warning fields. Convert defensively so a NULL
+        # legacy column (one ALTER TABLE ADD COLUMN that escaped the migration
+        # backfill, in theory) lands as an empty list rather than blowing up
+        # downstream consumers that iterate.
+        step.prewarning_offsets_seconds = list(self.prewarning_offsets_seconds or [])
+        step.prewarnings_fired = list(self.prewarnings_fired or [])
         # Dependency IDs are stored on the dataclass as a list of step IDs.
         step.dependencies = [d.id for d in (self.dependencies or [])]
         return step

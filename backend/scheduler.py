@@ -198,6 +198,18 @@ class Scheduler:
                 # rejects the move if the resulting graph violates R1.
                 if inc.condition_id:
                     target.condition_id = inc.condition_id
+                # U3: ``inherits_elapsed_from`` is editable -- the Designer's
+                # toggle writes "previous" or undefined. Copy it through so a
+                # rename of the directive between saves persists.
+                target.inherits_elapsed_from = inc.inherits_elapsed_from
+                # U4: ``prewarning_offsets_seconds`` is editable config from
+                # the Designer; ``prewarnings_fired`` is RUNTIME state we
+                # never let the client overwrite. Preserve target.prewarnings_fired
+                # untouched so a save mid-run doesn't silently re-fire warnings
+                # that already delivered.
+                target.prewarning_offsets_seconds = list(
+                    inc.prewarning_offsets_seconds or []
+                )
                 # Re-derive scheduled_end_time if a scheduled_start exists.
                 if target.scheduled_start_time:
                     target.scheduled_end_time = target.scheduled_start_time + target.duration

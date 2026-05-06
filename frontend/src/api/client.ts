@@ -39,6 +39,17 @@ export interface Step {
   // the server pre-seeds elapsed_seconds on START so the existing
   // ``duration_seconds - elapsed_seconds`` math just works.
   inherits_elapsed_from?: string;
+  // U4 pre-warnings. Two parallel int-second lists:
+  // * ``prewarning_offsets_seconds`` -- user-configured "warn me N seconds
+  //   before expected end" thresholds. The Designer manages this list; the
+  //   Runner reads it on every tick.
+  // * ``prewarnings_fired`` -- server-tracked dedupe state. The Runner
+  //   reads it to know which offsets have already delivered (don't re-fire);
+  //   the server is the only writer (via the prewarning_hit socket handler).
+  // Both keys are present on every persisted step (even when empty) so the
+  // Runner can iterate without optional-chaining branches.
+  prewarning_offsets_seconds?: number[];
+  prewarnings_fired?: number[];
 }
 
 // Condition: a named grouping of steps within an Experiment. Multiple

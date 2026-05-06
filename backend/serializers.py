@@ -74,6 +74,19 @@ def step_to_dict(step) -> Dict[str, Any]:
     if inherits:
         out["inherits_elapsed_from"] = inherits
 
+    # U4 pre-warnings. Both fields ALWAYS go on the wire, even when empty:
+    # * The Runner reads ``prewarning_offsets_seconds`` on every tick to know
+    #   which offsets to watch; an absent key would force the client to
+    #   default-to-empty branching and risks a regression where a future
+    #   field rename silently produces "no warnings" behaviour.
+    # * The Runner reads ``prewarnings_fired`` to know which offsets to
+    #   SKIP on each tick. Absence here would mean "fire every offset
+    #   forever" which is the exact bug dedupe exists to prevent.
+    out["prewarning_offsets_seconds"] = list(
+        getattr(step, "prewarning_offsets_seconds", []) or []
+    )
+    out["prewarnings_fired"] = list(getattr(step, "prewarnings_fired", []) or [])
+
     return out
 
 

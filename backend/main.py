@@ -143,6 +143,33 @@ def get_experiment(experiment_id):
 
     return jsonify(experiment_to_dict(experiment))
 
+def _coerce_prewarning_offsets(raw) -> list:
+    """Normalize pre-warning offsets from a wire payload into List[int].
+
+    The Designer sends positive integers; we accept floats / strings too and
+    coerce-or-drop. Negative / zero values are filtered out (a "pre-warning"
+    at the moment of completion is meaningless; a negative offset is
+    nonsense). Duplicates are de-duped while preserving order so the
+    Designer's chip list and the persisted list stay aligned.
+    """
+    if not raw:
+        return []
+    seen = set()
+    out = []
+    for entry in raw:
+        try:
+            n = int(entry)
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
 def _step_from_payload(step_data: dict) -> Step:
     """Build a ``Step`` from an incoming JSON payload.
 
@@ -168,6 +195,12 @@ def _step_from_payload(step_data: dict) -> Step:
         # sibling Step's id (within the same Condition) or the literal
         # "previous". Resolution lives in start_step (below).
         inherits_elapsed_from=step_data.get('inherits_elapsed_from'),
+        # U4 pre-warnings. Configuration only -- ``prewarnings_fired`` is
+        # server-tracked dedup state and is never accepted from the wire (the
+        # client cannot pretend it has already received a warning).
+        prewarning_offsets_seconds=_coerce_prewarning_offsets(
+            step_data.get('prewarning_offsets_seconds')
+        ),
     )
 
 
@@ -1057,6 +1090,102 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     print('Client disconnected')
+
+
+@socketio.on('prewarning_hit')
+def handle_prewarning_hit(payload):
+    """Server-side dedupe for U4 pre-warnings.
+
+    Contract: clients tick once per second and emit ``prewarning_hit`` with
+    ``{step_id, offset_seconds}`` whenever ``(expected_end - now) <= offset``
+    AND the offset isn't yet in ``prewarnings_fired``. The server is the
+    source of truth for "did we already fire this offset?" -- on receipt:
+
+      * Validate the JWT (same query-string transport as ``connect``).
+      * Resolve the step + experiment. Silent no-op (NOT 401) if the user
+        can't view the experiment -- consistent with existing connect-handler
+        behaviour. We don't want this socket event to be a probe vector for
+        existence-privacy.
+      * Validate ``offset_seconds`` is in ``step.prewarning_offsets_seconds``
+        AND NOT already in ``step.prewarnings_fired``.
+      * On valid+fresh: append to ``prewarnings_fired``, persist via
+        ``scheduler._persist_step_state``, fire the notification factory,
+        emit experiment_update so other tabs see the updated fired list.
+      * On duplicate: silent no-op.
+
+    Limitation accepted in v1: pre-warnings only fire when at least one user
+    client has the Runner open. Background-tick delivery is the deferred
+    follow-up. See plan §"Pre-warning delivery" for the rationale.
+    """
+    try:
+        verify_jwt_in_request(locations=['query_string'])
+        username = get_jwt_identity()
+    except Exception:
+        # Unauthenticated client -- silently drop. We deliberately don't emit
+        # an error event back; clients can't recover from missing auth here
+        # and a leaked error type would help an attacker probe.
+        return
+
+    if not isinstance(payload, dict):
+        return
+    step_id = payload.get('step_id')
+    raw_offset = payload.get('offset_seconds')
+    if not step_id or raw_offset is None:
+        return
+    try:
+        offset_seconds = int(raw_offset)
+    except (TypeError, ValueError):
+        return
+
+    user = get_user(username) if username else None
+    step = scheduler.get_step(step_id)
+    experiment = _find_experiment_for_step(step_id) if step else None
+    if not step or not experiment:
+        return
+    # Existence-privacy: a user without view permission learns nothing here.
+    # No 401 / no error event -- just return silently.
+    if not can_view_experiment(user, experiment):
+        return
+
+    # Validate the offset is one the step actually declared. Defensive: don't
+    # let a malicious client pollute prewarnings_fired with arbitrary numbers.
+    declared = list(step.prewarning_offsets_seconds or [])
+    if offset_seconds not in declared:
+        return
+
+    fired = list(step.prewarnings_fired or [])
+    if offset_seconds in fired:
+        # Duplicate fire -- the dedupe contract holds. The second emitter
+        # gets a silent no-op; their UI will see the post-fire experiment
+        # snapshot via the broadcast we already sent on the first emit.
+        return
+
+    # Fresh fire. Append + persist before broadcasting so any client that
+    # immediately re-fetches sees the updated state.
+    fired.append(offset_seconds)
+    step.prewarnings_fired = fired
+    try:
+        scheduler._persist_step_state(step)
+    except Exception as exc:
+        logger.warning("prewarning_hit persist failed: %s", exc)
+        # Don't fan out the notification on persist failure -- the dedupe
+        # state didn't actually save, so a retry should still fire it.
+        return
+
+    owner = getattr(experiment, "owner", None)
+    if owner:
+        try:
+            notification = notification_factories["step_prewarning"](
+                step, experiment, offset_seconds, target_users=[owner]
+            )
+            notification_service.add_notification(notification)
+        except Exception as exc:
+            logger.warning("step_prewarning notification emit failed: %s", exc)
+
+    # Push the updated experiment so every connected client (including other
+    # tabs of the same user) refreshes their local prewarnings_fired list and
+    # stops emitting for this offset.
+    _emit_experiment_update(experiment)
 
 if __name__ == "__main__":
     # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000.

@@ -258,6 +258,16 @@ const ExperimentRunner: React.FC = () => {
     handleStepCompleteRef.current = handleStepComplete;
   }, [handleStepComplete]);
 
+  // U4 pre-warnings: track which (stepId, offset) pairs we've ALREADY emitted
+  // during the lifetime of this Runner mount. The server's ``prewarnings_fired``
+  // list is the durable source of truth, but its update arrives via the next
+  // ``experiment_update`` socket push; until that push lands we'd otherwise
+  // re-emit on every tick. This local set bridges the latency: a tick after
+  // an emit checks the set first and doesn't re-fire even before the server
+  // round-trips the new state. Cleared on unmount; on reconnect / remount the
+  // server's prewarnings_fired list is the dedupe authority anyway.
+  const localPrewarningEmits = useRef<Set<string>>(new Set());
+
   // Per-second tick: refresh ``currentTime`` so the running-step elapsed
   // counter re-renders, and auto-complete any FIXED_DURATION step that has
   // run past its budget.
@@ -289,6 +299,46 @@ const ExperimentRunner: React.FC = () => {
           if (elapsed >= step.duration_seconds) {
             handleStepCompleteRef.current(step.id);
           }
+        }
+
+        // U4 pre-warnings: client-fires + server-dedupes. For any RUNNING
+        // step with declared offsets that haven't yet fired, check whether
+        // ``secondsRemaining <= offset`` and emit ``prewarning_hit``. We
+        // rely on the same per-tick currentTime advance the auto-complete
+        // logic uses; no extra setInterval needed.
+        //
+        // Three skip cases per offset:
+        //   1. server-confirmed in step.prewarnings_fired (post-broadcast)
+        //   2. locally emitted this mount (pre-broadcast latency window)
+        //   3. step isn't actually RUNNING (PENDING / READY etc.)
+        if (
+          step.status === StepStatus.RUNNING &&
+          step.actual_start_time &&
+          step.prewarning_offsets_seconds &&
+          step.prewarning_offsets_seconds.length > 0
+        ) {
+          const elapsedSinceStart = differenceInSeconds(
+            new Date(),
+            parseISO(step.actual_start_time)
+          );
+          // Total elapsed = pre-existing elapsed (e.g. seeded by U3 cascading
+          // time, or accumulated across pause/resume) + the live tick. The
+          // backend's ``Step.start()`` resets actual_start_time to "now" on
+          // every resume but preserves elapsed_seconds across pauses, so this
+          // formula stays correct under pause/resume.
+          const elapsedSoFar = (step.elapsed_seconds || 0) + elapsedSinceStart;
+          const secondsRemaining = step.duration_seconds - elapsedSoFar;
+          const fired = step.prewarnings_fired || [];
+
+          step.prewarning_offsets_seconds.forEach((offset) => {
+            if (fired.includes(offset)) return;
+            const localKey = `${step.id}:${offset}`;
+            if (localPrewarningEmits.current.has(localKey)) return;
+            if (secondsRemaining <= offset) {
+              localPrewarningEmits.current.add(localKey);
+              socketService.emitPrewarningHit(step.id, offset);
+            }
+          });
         }
       });
     }, 1000);

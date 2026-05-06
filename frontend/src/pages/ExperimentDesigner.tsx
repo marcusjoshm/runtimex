@@ -72,6 +72,12 @@ interface Step {
   // a sibling-id picker yet because the brainstorm's primary case is the
   // wash -> re-incubate adjacency.
   inherits_elapsed_from?: string;
+  // U4 pre-warnings: list of "fire N seconds before expected end" thresholds.
+  // The Designer's chip-input edits this list; we send it on save as
+  // ``prewarning_offsets_seconds`` (snake_case wire) and load it back from
+  // the same key. Empty array = no pre-warnings, which is the default for
+  // newly-added steps.
+  prewarning_offsets_seconds: number[];
 }
 
 interface Experiment {
@@ -101,6 +107,129 @@ const newCondition = (
   order_index: defaults.order_index ?? 0,
   description: defaults.description,
 });
+
+// U4 pre-warning chip-input. A small, focused subcomponent so the main
+// step-dialog Grid stays readable. Validates: positive integer; warns
+// (without blocking) when the offset is >= duration -- per the plan, that
+// fires immediately on START, which is allowed but flagged.
+const PrewarningOffsetEditor: React.FC<{
+  offsets: number[];
+  durationSeconds: number;
+  onChange: (next: number[]) => void;
+}> = ({ offsets, durationSeconds, onChange }) => {
+  const [draft, setDraft] = useState<string>('');
+  const [parseError, setParseError] = useState<string | null>(null);
+
+  const handleAdd = () => {
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+      setParseError('Enter a positive integer (seconds before end).');
+      return;
+    }
+    if (offsets.includes(n)) {
+      setParseError('That offset is already in the list.');
+      return;
+    }
+    // Sort descending so the largest "fires earliest" offset appears first;
+    // matches how the Runner reasons about them ("which warns me first?").
+    const next = [...offsets, n].sort((a, b) => b - a);
+    onChange(next);
+    setDraft('');
+    setParseError(null);
+  };
+
+  const handleRemove = (offset: number) => {
+    onChange(offsets.filter((o) => o !== offset));
+  };
+
+  // Sort just for display so an unsorted incoming list (legacy data) is
+  // still visually consistent.
+  const displayOffsets = [...offsets].sort((a, b) => b - a);
+
+  // Per the plan: offsets >= duration fire immediately on START. That's
+  // allowed; we just flag it inline so the user notices.
+  const oversizedOffsets = displayOffsets.filter(
+    (o) => durationSeconds > 0 && o >= durationSeconds
+  );
+
+  return (
+    <Box>
+      <Typography variant="subtitle2" gutterBottom>
+        Pre-warnings
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+        A pre-warning fires a notification N seconds before this step's
+        expected end (e.g., 600 = "warn me 10 minutes before this step ends").
+      </Typography>
+      <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, mb: 1 }}>
+        <TextField
+          label="Add pre-warning (seconds before end)"
+          type="number"
+          size="small"
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            if (parseError) setParseError(null);
+          }}
+          onKeyDown={(e) => {
+            // Enter-to-add for fast multi-entry. The form's outer submit
+            // button is the dialog's Save Step, not the experiment Save, so
+            // there's no risk of accidentally posting the whole experiment.
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              handleAdd();
+            }
+          }}
+          inputProps={{ min: 1 }}
+          sx={{ flex: 1 }}
+          error={Boolean(parseError)}
+          helperText={parseError}
+        />
+        <Button
+          variant="outlined"
+          onClick={handleAdd}
+          disabled={!draft.trim()}
+          sx={{ mt: 0.5 }}
+        >
+          Add
+        </Button>
+      </Box>
+      {displayOffsets.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">
+          No pre-warnings configured.
+        </Typography>
+      ) : (
+        <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          {displayOffsets.map((offset) => {
+            const minutes = Math.floor(offset / 60);
+            const seconds = offset % 60;
+            const label =
+              minutes > 0 && seconds === 0
+                ? `${minutes} min before end`
+                : minutes > 0
+                ? `${minutes}m ${seconds}s before end`
+                : `${seconds}s before end`;
+            return (
+              <Chip
+                key={offset}
+                label={label}
+                onDelete={() => handleRemove(offset)}
+              />
+            );
+          })}
+        </Stack>
+      )}
+      {oversizedOffsets.length > 0 && (
+        <FormHelperText sx={{ color: 'warning.main', mt: 1 }}>
+          {oversizedOffsets.length === 1 ? 'One offset is' : 'Some offsets are'}{' '}
+          larger than this step's duration; they will fire immediately on START.
+        </FormHelperText>
+      )}
+    </Box>
+  );
+};
 
 const ExperimentDesigner: React.FC = () => {
   const navigate = useNavigate();
@@ -209,6 +338,11 @@ const ExperimentDesigner: React.FC = () => {
             resource_required: s.resource_required,
             condition_id: s.condition_id || fallbackConditionId,
             inherits_elapsed_from: s.inherits_elapsed_from,
+            // U4: hydrate the configured offsets list. Defensive copy so the
+            // Designer's local edits don't mutate the loaded ApiStep object.
+            prewarning_offsets_seconds: Array.isArray(s.prewarning_offsets_seconds)
+              ? [...s.prewarning_offsets_seconds]
+              : [],
           })),
         });
       })
@@ -330,6 +464,8 @@ const ExperimentDesigner: React.FC = () => {
       duration_minutes: 30,
       dependencies: [],
       condition_id: defaultConditionId(),
+      // U4: default to no pre-warnings; user adds them via the chip input.
+      prewarning_offsets_seconds: [],
     });
     setEditStepIndex(null);
     setOpenStepDialog(true);
@@ -482,6 +618,10 @@ const ExperimentDesigner: React.FC = () => {
         ...(s.inherits_elapsed_from
           ? { inherits_elapsed_from: s.inherits_elapsed_from }
           : {}),
+        // U4: always send the offset list so a user can DELETE all chips on
+        // an existing step and have the empty list persist (vs. an
+        // "if non-empty" guard that would treat removal as a no-op).
+        prewarning_offsets_seconds: [...s.prewarning_offsets_seconds],
       })),
     };
 
@@ -1065,6 +1205,25 @@ const ExperimentDesigner: React.FC = () => {
                 </Grid>
               );
             })()}
+            {/* U4 pre-warnings: chip-input for "fire N seconds before end"
+                offsets. The user types a positive integer, clicks Add, and
+                we push it to the list (deduped, sorted descending so the
+                largest "earliest" offset is most visible). The Runner watches
+                this list every tick and emits prewarning_hit when crossed. */}
+            {currentStep && (
+              <Grid item xs={12}>
+                <PrewarningOffsetEditor
+                  offsets={currentStep.prewarning_offsets_seconds}
+                  durationSeconds={currentStep.duration_minutes * 60}
+                  onChange={(next) =>
+                    setCurrentStep({
+                      ...currentStep,
+                      prewarning_offsets_seconds: next,
+                    })
+                  }
+                />
+              </Grid>
+            )}
           </Grid>
         </DialogContent>
         <DialogActions>

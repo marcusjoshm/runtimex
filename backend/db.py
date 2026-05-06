@@ -102,6 +102,53 @@ def _run_migrations() -> None:
             logger.info("Adding steps.inherits_elapsed_from column (U3 cascading time)")
             with bind.begin() as conn:
                 conn.execute(text("ALTER TABLE steps ADD COLUMN inherits_elapsed_from TEXT"))
+        # U4 pre-warnings: two JSON list columns. SQLite's ALTER TABLE ADD COLUMN
+        # ... TEXT does NOT honor SQLAlchemy's ``default=list`` for legacy rows,
+        # so after adding the column we backfill any NULL value to ``'[]'`` so
+        # downstream consumers (which iterate without None-checking) stay happy.
+        # The UPDATE is idempotent: subsequent boots find no NULLs and do nothing.
+        if "prewarning_offsets_seconds" not in step_cols:
+            logger.info("Adding steps.prewarning_offsets_seconds column (U4 pre-warnings)")
+            with bind.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE steps ADD COLUMN prewarning_offsets_seconds TEXT")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE steps SET prewarning_offsets_seconds = '[]' "
+                        "WHERE prewarning_offsets_seconds IS NULL"
+                    )
+                )
+        else:
+            # Idempotent backfill: a previous run may have added the column but
+            # left existing rows NULL (e.g. an aborted earlier migration).
+            with bind.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE steps SET prewarning_offsets_seconds = '[]' "
+                        "WHERE prewarning_offsets_seconds IS NULL"
+                    )
+                )
+        if "prewarnings_fired" not in step_cols:
+            logger.info("Adding steps.prewarnings_fired column (U4 pre-warnings)")
+            with bind.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE steps ADD COLUMN prewarnings_fired TEXT")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE steps SET prewarnings_fired = '[]' "
+                        "WHERE prewarnings_fired IS NULL"
+                    )
+                )
+        else:
+            with bind.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE steps SET prewarnings_fired = '[]' "
+                        "WHERE prewarnings_fired IS NULL"
+                    )
+                )
 
     # 2. Backfill: every Experiment without any Conditions gets a "Main"
     #    Condition; that Experiment's Steps inherit its id.
