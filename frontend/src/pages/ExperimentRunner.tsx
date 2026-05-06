@@ -3,38 +3,25 @@ import { useParams, useNavigate } from 'react-router-dom';
 import {
   Box,
   Button,
-  Card,
-  CardContent,
-  CardActions,
-  Chip,
   Container,
   Grid,
   LinearProgress,
   Paper,
+  Stack,
   Typography,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
-  List,
-  ListItem,
-  ListItemText,
-  Divider,
   IconButton,
   Alert,
-  ButtonGroup,
-  Snackbar
+  Snackbar,
 } from '@mui/material';
-import PlayArrowIcon from '@mui/icons-material/PlayArrow';
-import PauseIcon from '@mui/icons-material/Pause';
-import CheckIcon from '@mui/icons-material/Check';
-import TimerIcon from '@mui/icons-material/Timer';
-import SkipNextIcon from '@mui/icons-material/SkipNext';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
-import ErrorIcon from '@mui/icons-material/Error';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
-import apiClient, { Experiment, Step, Conflict } from '../api/client';
+import apiClient, { Experiment, Step, Condition, Conflict } from '../api/client';
 import socketService from '../api/socket';
+import ConditionLane from '../components/ConditionLane';
 
 // Maps to match backend enum values
 const StepStatus = {
@@ -482,34 +469,39 @@ const ExperimentRunner: React.FC = () => {
     setShowInfoDialog(true);
   };
 
-  const getStepStatusChip = (status: string) => {
-    switch (status) {
-      case StepStatus.PENDING:
-        return <Chip label="Pending" color="default" size="small" />;
-      case StepStatus.READY:
-        return <Chip label="Ready" color="primary" size="small" />;
-      case StepStatus.RUNNING:
-        return <Chip label="Running" color="secondary" size="small" />;
-      case StepStatus.PAUSED:
-        return <Chip label="Paused" color="warning" size="small" />;
-      case StepStatus.COMPLETED:
-        return <Chip label="Completed" color="success" size="small" icon={<CheckIcon />} />;
-      case StepStatus.SKIPPED:
-        return <Chip label="Skipped" color="default" size="small" icon={<SkipNextIcon />} />;
-      case StepStatus.ERROR:
-        return <Chip label="Error" color="error" size="small" icon={<ErrorIcon />} />;
-      default:
-        return <Chip label={status} size="small" />;
-    }
-  };
-
-  const formatTime = (seconds?: number) => {
-    if (seconds === undefined) return '--:--';
-    const safe = Math.max(0, Math.floor(seconds));
-    const mins = Math.floor(safe / 60);
-    const secs = safe % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
+  // U5 push-condition handler. Centralised here so each lane's "Push" buttons
+  // share the same error / Snackbar plumbing as handleExtendStep above. The
+  // server applies the delta to PENDING/READY steps in the named Condition,
+  // re-runs conflict detection, and broadcasts ``experiment_update``; the
+  // socket handler refreshes our local state independently.
+  const handlePushCondition = useCallback(
+    async (conditionId: string, conditionName: string, deltaSeconds: number) => {
+      try {
+        const response = await apiClient.pushCondition(conditionId, deltaSeconds);
+        setExperiment(response);
+        const sign = deltaSeconds >= 0 ? '+' : '-';
+        const minutes = Math.abs(deltaSeconds) / 60;
+        const label =
+          minutes >= 1 ? `${sign}${minutes} min` : `${sign}${Math.abs(deltaSeconds)} sec`;
+        setLiveEditFeedback({
+          message: `Pushed "${conditionName}" by ${label}`,
+          severity: 'success',
+        });
+      } catch (err: any) {
+        console.error('Failed to push condition:', err);
+        const status = err?.response?.status;
+        const detail =
+          err?.response?.data?.error ||
+          (status === 403
+            ? 'Edit permission required'
+            : status === 404
+            ? 'Condition not found'
+            : 'Failed to push condition');
+        setLiveEditFeedback({ message: detail, severity: 'error' });
+      }
+    },
+    []
+  );
 
   // Convert duration_seconds -> human-readable minutes for the static labels.
   // Sub-minute durations show "<1 min" so a 30-second step doesn't render as
@@ -518,13 +510,6 @@ const ExperimentRunner: React.FC = () => {
     if (!Number.isFinite(seconds) || seconds <= 0) return '0 min';
     if (seconds < 60) return '<1 min';
     return `${Math.floor(seconds / 60)} min`;
-  };
-
-  const getProgress = (step: Step) => {
-    if (!step.elapsed_seconds || step.step_type === StepType.TASK) return 0;
-    if (!step.duration_seconds || step.duration_seconds <= 0) return 0;
-    const progress = (step.elapsed_seconds / step.duration_seconds) * 100;
-    return Math.min(progress, 100);
   };
 
   const formatDateTime = (dateStr?: string) => {
@@ -566,14 +551,51 @@ const ExperimentRunner: React.FC = () => {
   }
 
   const activeStep = activeStepIndex !== null ? experiment.steps[activeStepIndex] : null;
+  const activeStepId = activeStep?.id ?? null;
   const pendingSteps = experiment.steps.filter(step => step.status === StepStatus.PENDING);
   const readySteps = experiment.steps.filter(step => step.status === StepStatus.READY);
   const runningSteps = experiment.steps.filter(step => step.status === StepStatus.RUNNING);
   const completedSteps = experiment.steps.filter(step => step.status === StepStatus.COMPLETED);
   const selectedStep = selectedStepId ? experiment.steps.find(step => step.id === selectedStepId) : null;
 
-  const allStepsComplete = experiment.steps.every(step => 
+  const allStepsComplete = experiment.steps.every(step =>
     step.status === StepStatus.COMPLETED || step.status === StepStatus.SKIPPED);
+
+  // Group steps by Condition for the swimlane layout. We sort lanes by
+  // ``order_index`` so the visual order matches what the Designer's
+  // Conditions sidebar showed at save time. Within each lane we preserve the
+  // experiment.steps array order (the user's authored sequence).
+  //
+  // Why inline rather than lift to a shared util: the Designer's grouping
+  // carries an ``originalIndex`` per entry (so move/delete handlers stay O(1))
+  // -- a contract the Runner doesn't need. Lifting a single util would force
+  // either a wider type or two near-identical groupers; the inline 5-line
+  // map+filter pays its weight here. See the Designer's ``stepsByCondition``
+  // (ExperimentDesigner.tsx) for the shape if/when this needs unifying.
+  const conditions: Condition[] = (experiment.conditions ?? [])
+    .slice()
+    .sort((a, b) => a.order_index - b.order_index);
+  // Defensive fallback: if the experiment payload predates U1 (shouldn't
+  // happen post-backfill, but a stale mock could) we render a single
+  // synthetic "Main" lane so the page doesn't go blank.
+  const lanes: Array<{ condition: Condition; steps: Step[] }> =
+    conditions.length > 0
+      ? conditions.map((c) => ({
+          condition: c,
+          steps: experiment.steps.filter((s) => s.condition_id === c.id),
+        }))
+      : [
+          {
+            condition: {
+              id: 'synthetic-main',
+              experiment_id: experiment.id,
+              name: 'Main',
+              color: 'slate',
+              order_index: 0,
+            },
+            steps: experiment.steps,
+          },
+        ];
 
   return (
     <Container maxWidth="lg">
@@ -629,176 +651,12 @@ const ExperimentRunner: React.FC = () => {
           </Grid>
         </Paper>
         
-        {/* Active Step Card */}
-        {activeStep && (
-          <Box sx={{ mb: 4 }}>
-            <Typography variant="h5" gutterBottom>
-              Current Step
-            </Typography>
-            <Card>
-              <CardContent>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
-                  <Typography variant="h6">{activeStep.name}</Typography>
-                  {getStepStatusChip(activeStep.status)}
-                </Box>
-                
-                <Grid container spacing={2}>
-                  <Grid item xs={12} md={6}>
-                    <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Type: {activeStep.step_type.replace('_', ' ')}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Duration: {formatDurationMinutes(activeStep.duration_seconds)}
-                    </Typography>
-                    {activeStep.resource_required && (
-                      <Typography variant="body2" color="text.secondary" gutterBottom>
-                        Resource: {activeStep.resource_required}
-                      </Typography>
-                    )}
-                    {activeStep.notes && (
-                      <Typography variant="body2" gutterBottom>
-                        Notes: {activeStep.notes}
-                      </Typography>
-                    )}
-                  </Grid>
-                  <Grid item xs={12} md={6}>
-                    {activeStep.status === StepStatus.RUNNING && (
-                      <>
-                        <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                          <TimerIcon sx={{ mr: 1 }} />
-                          <Typography variant="h6">
-                            {formatTime(activeStep.elapsed_seconds)}
-                          </Typography>
-                        </Box>
-
-                        {activeStep.step_type !== StepType.TASK && (
-                          <LinearProgress
-                            variant="determinate"
-                            value={getProgress(activeStep)}
-                            sx={{ height: 10, mt: 1 }}
-                          />
-                        )}
-                      </>
-                    )}
-                  </Grid>
-                </Grid>
-              </CardContent>
-              <CardActions>
-                {activeStep.status === StepStatus.READY && (
-                  <Button 
-                    color="primary" 
-                    variant="contained"
-                    startIcon={<PlayArrowIcon />}
-                    onClick={() => handleStepStart(activeStep.id)}
-                  >
-                    Start Step
-                  </Button>
-                )}
-                
-                {activeStep.status === StepStatus.RUNNING && (
-                  <>
-                    {activeStep.step_type === StepType.TASK && (
-                      <Button 
-                        color="warning" 
-                        variant="contained"
-                        startIcon={<PauseIcon />}
-                        onClick={() => handleStepPause(activeStep.id)}
-                      >
-                        Pause
-                      </Button>
-                    )}
-                    
-                    <Button 
-                      color="success" 
-                      variant="contained"
-                      startIcon={<CheckIcon />}
-                      onClick={() => handleStepComplete(activeStep.id)}
-                    >
-                      Complete
-                    </Button>
-                  </>
-                )}
-                
-                {activeStep.status === StepStatus.PAUSED && (
-                  <>
-                    <Button 
-                      color="primary" 
-                      variant="contained"
-                      startIcon={<PlayArrowIcon />}
-                      onClick={() => handleStepResume(activeStep.id)}
-                    >
-                      Resume
-                    </Button>
-                    
-                    <Button 
-                      color="success" 
-                      variant="contained"
-                      startIcon={<CheckIcon />}
-                      onClick={() => handleStepComplete(activeStep.id)}
-                    >
-                      Complete
-                    </Button>
-                  </>
-                )}
-                
-                {activeStep.status !== StepStatus.COMPLETED && activeStep.status !== StepStatus.SKIPPED && (
-                  <Button
-                    color="error"
-                    startIcon={<SkipNextIcon />}
-                    onClick={() => handleStepSkip(activeStep.id)}
-                  >
-                    Skip
-                  </Button>
-                )}
-
-                {/* U5 live-edit: extend / shrink the active step. Hidden when
-                    the step is COMPLETED or SKIPPED (no further duration
-                    edits make sense). The server clamps shrinks that would
-                    push duration below current elapsed and surfaces a
-                    warning string we render via the Snackbar below. */}
-                {activeStep.status !== StepStatus.COMPLETED &&
-                  activeStep.status !== StepStatus.SKIPPED && (
-                    <ButtonGroup
-                      size="small"
-                      variant="outlined"
-                      sx={{ ml: 'auto' }}
-                      aria-label="adjust step duration"
-                    >
-                      <Button
-                        onClick={() => handleExtendStep(activeStep.id, -60)}
-                        aria-label="shrink one minute"
-                      >
-                        -1m
-                      </Button>
-                      <Button
-                        onClick={() => handleExtendStep(activeStep.id, 60)}
-                        aria-label="extend one minute"
-                      >
-                        +1m
-                      </Button>
-                      <Button
-                        onClick={() => handleExtendStep(activeStep.id, -300)}
-                        aria-label="shrink five minutes"
-                      >
-                        -5m
-                      </Button>
-                      <Button
-                        onClick={() => handleExtendStep(activeStep.id, 300)}
-                        aria-label="extend five minutes"
-                      >
-                        +5m
-                      </Button>
-                    </ButtonGroup>
-                  )}
-              </CardActions>
-            </Card>
-          </Box>
-        )}
-        
         {/* Resource conflict warnings (U6). Non-blocking on purpose: the
             previous dialog interrupted the user's flow on every Start click.
-            The server's check_for_conflicts powers this list, so it stays
-            consistent with whatever U7 will use to fire notifications. */}
+            The server's check_for_conflicts powers this list (with U2's
+            condition labels), so it stays consistent with whatever U7 will
+            use to fire notifications. Rendered above the swimlanes so a
+            multi-lane experiment shows the cross-lane impact at a glance. */}
         {conflicts.length > 0 && (
           <Alert severity="warning" sx={{ mb: 3 }}>
             <Typography variant="subtitle2" gutterBottom>
@@ -812,38 +670,40 @@ const ExperimentRunner: React.FC = () => {
           </Alert>
         )}
 
-        {/* Steps List */}
-        <Box sx={{ mb: 4 }}>
-          <Typography variant="h5" gutterBottom>
-            All Steps
-          </Typography>
-          <List component={Paper}>
-            {experiment.steps.map((step, index) => (
-              <React.Fragment key={step.id}>
-                {index > 0 && <Divider />}
-                <ListItem
-                  secondaryAction={
-                    <Box>
-                      {step.status === StepStatus.RUNNING && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mr: 2 }}>
-                          {formatTime(step.elapsed_seconds)}
-                        </Typography>
-                      )}
-                      {getStepStatusChip(step.status)}
-                    </Box>
-                  }
-                  onClick={() => showStepDetails(step.id)}
-                  sx={{ cursor: 'pointer' }}
-                >
-                  <ListItemText
-                    primary={`${index + 1}. ${step.name}`}
-                    secondary={`Type: ${step.step_type.replace('_', ' ')} | Duration: ${formatDurationMinutes(step.duration_seconds)} | Resource: ${step.resource_required || 'none'}`}
-                  />
-                </ListItem>
-              </React.Fragment>
-            ))}
-          </List>
-        </Box>
+        {/* U6 swimlane layout. One ConditionLane per Condition, sorted by
+            order_index. Each lane handles its own per-step rendering,
+            highlights the active step, surfaces start/pause/complete/skip
+            controls on it, and (when ``onPushCondition`` is provided) shows
+            the +/-5m push controls in its header. The ``onStepClick`` for
+            non-active step cards opens the existing details dialog so the
+            page's information density isn't lost on a single-active-step
+            view. */}
+        <Stack spacing={3} sx={{ mb: 4 }}>
+          {lanes.map(({ condition, steps }) => (
+            <ConditionLane
+              key={condition.id}
+              condition={condition}
+              steps={steps}
+              activeStepId={activeStepId}
+              onStepClick={(s) => showStepDetails(s.id)}
+              onStartStep={(s) => handleStepStart(s.id)}
+              onPauseStep={(s) => handleStepPause(s.id)}
+              onResumeStep={(s) => handleStepResume(s.id)}
+              onCompleteStep={(s) => handleStepComplete(s.id)}
+              onSkipStep={(s) => handleStepSkip(s.id)}
+              onExtendStep={(s, delta) => handleExtendStep(s.id, delta)}
+              onPushCondition={
+                // Only attach the push handler for "real" conditions; the
+                // synthetic-main fallback above can't push anything (the
+                // server has no Condition row with that id and would 404).
+                condition.id === 'synthetic-main'
+                  ? undefined
+                  : (delta) =>
+                      handlePushCondition(condition.id, condition.name, delta)
+              }
+            />
+          ))}
+        </Stack>
       </Box>
       
       {/* Step Info Dialog */}

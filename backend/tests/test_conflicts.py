@@ -368,3 +368,135 @@ def test_update_experiment_response_includes_conflicts(client, auth_headers):
     assert "conflicts" in body
     assert len(body["conflicts"]) == 1
     assert body["conflicts"][0]["resource"] == "microscope"
+
+
+# ---------------------------------------------------------------------------
+# 10. U6: single-Condition Experiment renders the auto-created "Main" lane in
+#     conflict payloads. The Runner uses condition_*_name in the inline alert,
+#     so a multi-resource overlap on a single-condition experiment must surface
+#     the "Main" label on both sides (not "Unknown" -- that's the missing-FK
+#     fallback path tested above).
+# ---------------------------------------------------------------------------
+def test_single_condition_experiment_uses_main_for_both_sides(client, auth_headers):
+    """No `conditions` in the create payload -> backend default-creates a
+    single "Main" Condition that owns every Step. Two microscope steps overlap
+    -> both sides of the conflict carry condition_*_name = "Main" and the same
+    condition_*_id (since they live in the same Condition).
+    """
+    payload = {
+        "name": "SwimlaneSingleMain",
+        "description": "single-condition lane test",
+        "steps": [
+            {
+                "name": "Image dish",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+            },
+            {
+                "name": "Image dish 2",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+            },
+        ],
+    }
+    r = client.post("/api/experiments", headers=auth_headers, json=payload)
+    assert r.status_code == 201, r.get_json()
+    exp_id = r.get_json()["id"]
+    created = r.get_json()
+
+    # Sanity: backend default-created exactly one "Main" Condition.
+    assert len(created["conditions"]) == 1
+    main_cond = created["conditions"][0]
+    assert main_cond["name"] == "Main"
+
+    r = client.get(f"/api/experiments/{exp_id}/conflicts", headers=auth_headers)
+    assert r.status_code == 200, r.get_json()
+    conflicts = r.get_json()
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # The Runner's swimlane Alert renders both sides as "(Main)" so a
+    # single-Condition experiment looks visually equivalent to the legacy
+    # flat-list runner (one lane, one label) -- no "Unknown" leakage.
+    assert c["condition_a_name"] == "Main"
+    assert c["condition_b_name"] == "Main"
+    assert c["condition_a_id"] == main_cond["id"]
+    assert c["condition_b_id"] == main_cond["id"]
+
+
+# ---------------------------------------------------------------------------
+# 11. U6: multi-Condition Experiment with two separately-named Conditions
+#     (microscope steps in each) yields a conflict whose payload labels both
+#     sides distinctly. This is the exact shape the Runner's swimlane Alert
+#     renders ("Image A (Condition A) <-> Image B (Condition B) on microscope").
+# ---------------------------------------------------------------------------
+def test_two_named_conditions_produce_distinct_labels(client, auth_headers):
+    """End-to-end via the Flask client: post a two-Condition experiment with
+    overlapping microscope steps; confirm the conflict payload pairs each
+    step with the *correct* condition name (not just "some name on each side").
+    """
+    payload = {
+        "name": "SwimlaneMultiCondition",
+        "description": "two parallel dishes share the microscope",
+        "conditions": [
+            {"id": "cond-a", "name": "Condition A", "color": "coral", "order_index": 0},
+            {"id": "cond-b", "name": "Condition B", "color": "teal", "order_index": 1},
+        ],
+        "steps": [
+            {
+                "id": "step-a-image",
+                "name": "Image A",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+                "condition_id": "cond-a",
+            },
+            {
+                "id": "step-b-image",
+                "name": "Image B",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+                "condition_id": "cond-b",
+            },
+        ],
+    }
+    r = client.post("/api/experiments", headers=auth_headers, json=payload)
+    assert r.status_code == 201, r.get_json()
+    exp_id = r.get_json()["id"]
+
+    r = client.get(f"/api/experiments/{exp_id}/conflicts", headers=auth_headers)
+    assert r.status_code == 200, r.get_json()
+    conflicts = r.get_json()
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # Sanity on the resource + ids regardless of pair ordering.
+    assert c["resource"] == "microscope"
+    assert {c["step_a"], c["step_b"]} == {"step-a-image", "step-b-image"}
+    assert {c["condition_a_id"], c["condition_b_id"]} == {"cond-a", "cond-b"}
+    assert {c["condition_a_name"], c["condition_b_name"]} == {
+        "Condition A",
+        "Condition B",
+    }
+
+    # Critical: the (id, name) pairs match step-by-step. If A's step is in
+    # the a_ position then A's condition must be the a_ condition, and same
+    # for B. This is the contract the Runner relies on when rendering
+    # "{step_a_name} ({condition_a_name}) <-> {step_b_name} ({condition_b_name})".
+    if c["step_a"] == "step-a-image":
+        assert c["condition_a_id"] == "cond-a"
+        assert c["condition_a_name"] == "Condition A"
+        assert c["condition_b_id"] == "cond-b"
+        assert c["condition_b_name"] == "Condition B"
+    else:
+        assert c["condition_a_id"] == "cond-b"
+        assert c["condition_a_name"] == "Condition B"
+        assert c["condition_b_id"] == "cond-a"
+        assert c["condition_b_name"] == "Condition A"
