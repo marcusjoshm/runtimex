@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Box,
@@ -15,7 +15,6 @@ import {
   Dialog,
   DialogTitle,
   DialogContent,
-  DialogContentText,
   DialogActions,
   List,
   ListItem,
@@ -32,7 +31,7 @@ import SkipNextIcon from '@mui/icons-material/SkipNext';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ErrorIcon from '@mui/icons-material/Error';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
-import apiClient, { Experiment, Step } from '../api/client';
+import apiClient, { Experiment, Step, Conflict } from '../api/client';
 import socketService from '../api/socket';
 
 // Maps to match backend enum values
@@ -62,10 +61,24 @@ const ExperimentRunner: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
-  const [showConflictDialog, setShowConflictDialog] = useState(false);
-  const [conflicts, setConflicts] = useState<{ step1: Step, step2: Step }[]>([]);
+  // Conflicts come from the backend's `Scheduler.check_for_conflicts` (U6).
+  // We refresh on mount and after every `experiment_update` socket push so
+  // the warning Alert stays in sync with the current schedule. The previous
+  // client-side check inside `handleStepStart` is removed -- it duplicated
+  // server logic and produced a double-dialog when both fired.
+  const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+
+  // ``experimentRef`` exists so the once-per-mount tick interval below can
+  // read the latest experiment without listing it as an effect dependency.
+  // Without it, the interval would tear down + rebuild every second a step
+  // is RUNNING (the audit's runaway-tick bug). The companion effect below
+  // keeps the ref synced on every render.
+  const experimentRef = useRef<Experiment | null>(null);
+  useEffect(() => {
+    experimentRef.current = experiment;
+  }, [experiment]);
 
   // Initialize socket connection
   useEffect(() => {
@@ -81,27 +94,45 @@ const ExperimentRunner: React.FC = () => {
   // Subscribe to experiment updates
   useEffect(() => {
     if (!experimentId) return;
-    
+
     // Start receiving updates for this experiment
     socketService.startExperimentUpdates(experimentId);
-    
+
     // Register handler for experiment updates
     const unsubscribe = socketService.onExperimentUpdate((updatedExperiment) => {
       // Only update if it's the current experiment
       if (updatedExperiment.id === experimentId) {
         setExperiment(updatedExperiment);
-        
+
         // Update active step index if needed
         const readyStepIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
         if (readyStepIndex !== -1 && activeStepIndex === null) {
           setActiveStepIndex(readyStepIndex);
         }
+
+        // Re-fetch conflicts. A step state transition can change which steps
+        // are READY/RUNNING -- a future U7 may emit notifications based on
+        // the same list, so keep this Alert source-of-truth aligned with the
+        // server's view. Errors here are non-fatal: silently fall back to
+        // showing whatever conflicts we last fetched.
+        apiClient.getConflicts(experimentId)
+          .then(setConflicts)
+          .catch((err) => console.error('Failed to refresh conflicts:', err));
       }
     });
-    
+
     // Clean up subscription
     return unsubscribe;
   }, [experimentId, activeStepIndex]);
+
+  // Initial conflict fetch on mount. The socket handler above keeps it
+  // refreshed, but the first paint also needs them.
+  useEffect(() => {
+    if (!experimentId) return;
+    apiClient.getConflicts(experimentId)
+      .then(setConflicts)
+      .catch((err) => console.error('Failed to fetch conflicts:', err));
+  }, [experimentId]);
 
   // Fetch experiment data
   useEffect(() => {
@@ -128,7 +159,8 @@ const ExperimentRunner: React.FC = () => {
         if (process.env.NODE_ENV === 'development' && experimentId === '1') {
           const now = new Date();
           
-          // Create sample experiment with steps
+          // Create sample experiment with steps. Wire format is snake_case +
+          // duration in seconds (U8); the mock matches the real shape.
           const mockExperiment: Experiment = {
             id: '1',
             name: 'Cell Culture Protocol',
@@ -137,46 +169,46 @@ const ExperimentRunner: React.FC = () => {
               {
                 id: 's1',
                 name: 'Prepare media',
-                type: StepType.TASK,
-                duration: 15,
+                step_type: StepType.TASK,
+                duration_seconds: 15 * 60,
                 status: StepStatus.READY,
                 dependencies: [],
-                resourceNeeded: 'lab_bench',
-                scheduledStartTime: now.toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 15 * 60 * 1000).toISOString()
+                resource_required: 'lab_bench',
+                scheduled_start_time: now.toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 15 * 60 * 1000).toISOString()
               },
               {
                 id: 's2',
                 name: 'Thaw cells',
-                type: StepType.FIXED_DURATION,
-                duration: 30,
+                step_type: StepType.FIXED_DURATION,
+                duration_seconds: 30 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s1'],
-                resourceNeeded: 'water_bath',
-                scheduledStartTime: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 45 * 60 * 1000).toISOString()
+                resource_required: 'water_bath',
+                scheduled_start_time: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 45 * 60 * 1000).toISOString()
               },
               {
                 id: 's3',
                 name: 'Centrifuge cells',
-                type: StepType.FIXED_DURATION,
-                duration: 5,
+                step_type: StepType.FIXED_DURATION,
+                duration_seconds: 5 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s2'],
-                resourceNeeded: 'centrifuge',
-                scheduledStartTime: new Date(now.getTime() + 45 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 50 * 60 * 1000).toISOString()
+                resource_required: 'centrifuge',
+                scheduled_start_time: new Date(now.getTime() + 45 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 50 * 60 * 1000).toISOString()
               },
               {
                 id: 's4',
                 name: 'Plate cells',
-                type: StepType.TASK,
-                duration: 20,
+                step_type: StepType.TASK,
+                duration_seconds: 20 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s3'],
-                resourceNeeded: 'hood',
-                scheduledStartTime: new Date(now.getTime() + 50 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 70 * 60 * 1000).toISOString()
+                resource_required: 'hood',
+                scheduled_start_time: new Date(now.getTime() + 50 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 70 * 60 * 1000).toISOString()
               }
             ]
           };
@@ -197,69 +229,91 @@ const ExperimentRunner: React.FC = () => {
     fetchExperiment();
   }, [experimentId]);
 
-  // Update current time every second and track elapsed time
+  // Auto-complete handler kept stable via useCallback so the timer effect
+  // below can list it in deps without re-creating the interval. The actual
+  // interval reads experiment via a ref, not the closure.
+  const handleStepComplete = useCallback(async (stepId: string) => {
+    try {
+      const updatedExperiment = await apiClient.completeStep(stepId);
+      setExperiment(updatedExperiment);
+
+      // Find next READY step and set as active
+      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
+      if (nextReadyIndex !== -1) {
+        setActiveStepIndex(nextReadyIndex);
+      } else {
+        // No more ready steps
+        setActiveStepIndex(null);
+      }
+    } catch (err) {
+      console.error('Failed to complete step:', err);
+      alert('Failed to complete step. Please try again.');
+    }
+  }, []);
+
+  // Stable ref to the latest handleStepComplete so the once-per-mount
+  // interval below never closes over a stale callback.
+  const handleStepCompleteRef = useRef(handleStepComplete);
+  useEffect(() => {
+    handleStepCompleteRef.current = handleStepComplete;
+  }, [handleStepComplete]);
+
+  // Per-second tick: refresh ``currentTime`` so the running-step elapsed
+  // counter re-renders, and auto-complete any FIXED_DURATION step that has
+  // run past its budget.
+  //
+  // We deliberately use ``[]`` deps and read the latest ``experiment`` from
+  // a ref. The previous implementation depended on ``experiment`` and called
+  // ``setExperiment`` inside the tick, which triggered a re-render -> effect
+  // teardown -> new interval every single second (the audit's runaway-tick
+  // bug). Now the interval is created exactly once on mount and torn down
+  // on unmount.
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTime(new Date());
-      
-      // Update running steps with elapsed time
-      if (experiment) {
-        const updatedSteps = experiment.steps.map(step => {
-          if (step.status === StepStatus.RUNNING && step.actualStartTime) {
-            const elapsed = differenceInSeconds(new Date(), parseISO(step.actualStartTime));
-            return { ...step, elapsedTime: elapsed };
+
+      const current = experimentRef.current;
+      if (!current) return;
+
+      // Auto-complete fixed-duration steps whose elapsed seconds have hit
+      // their budget. We compute elapsed from actual_start_time each tick so
+      // we don't rely on the server for sub-second polling. duration_seconds
+      // is already in seconds (U8) so the comparison is direct -- no `* 60`.
+      current.steps.forEach((step) => {
+        if (
+          step.status === StepStatus.RUNNING &&
+          step.step_type === StepType.FIXED_DURATION &&
+          step.actual_start_time
+        ) {
+          const elapsed = differenceInSeconds(new Date(), parseISO(step.actual_start_time));
+          if (elapsed >= step.duration_seconds) {
+            handleStepCompleteRef.current(step.id);
           }
-          return step;
-        });
-        
-        setExperiment({ ...experiment, steps: updatedSteps });
-        
-        // Auto-complete fixed duration steps if they have finished
-        updatedSteps.forEach((step) => {
-          if (step.status === StepStatus.RUNNING && 
-              step.type === StepType.FIXED_DURATION && 
-              step.actualStartTime && 
-              step.elapsedTime && 
-              step.elapsedTime >= step.duration * 60) {
-            handleStepComplete(step.id);
-          }
-        });
-      }
+        }
+      });
     }, 1000);
-    
+
     return () => clearInterval(timer);
-  }, [experiment]);
+  }, []);
 
   // Handle step actions
   const handleStepStart = async (stepId: string) => {
     if (!experiment) return;
-    
+
+    // U6: conflict detection now lives on the server. The client-side
+    // pairwise check that used to live here was removed -- it duplicated
+    // the backend's `Scheduler.check_for_conflicts` (run once per
+    // `experiment_update`), and when both fired the user saw a redundant
+    // dialog. Conflicts are surfaced via the warning Alert above the step
+    // grid; nothing to do here except start the step.
     try {
       const updatedExperiment = await apiClient.startStep(stepId);
       setExperiment(updatedExperiment);
-      
+
       // Set this step as active
       const newActiveIndex = updatedExperiment.steps.findIndex(step => step.id === stepId);
       if (newActiveIndex !== -1) {
         setActiveStepIndex(newActiveIndex);
-      }
-      
-      // Check for conflicts (steps running at the same time that use the same resource)
-      const runningSteps = updatedExperiment.steps.filter(step => step.status === StepStatus.RUNNING);
-      const newConflicts = [];
-      
-      for (let i = 0; i < runningSteps.length; i++) {
-        for (let j = i + 1; j < runningSteps.length; j++) {
-          if (runningSteps[i].resourceNeeded && 
-              runningSteps[i].resourceNeeded === runningSteps[j].resourceNeeded) {
-            newConflicts.push({ step1: runningSteps[i], step2: runningSteps[j] });
-          }
-        }
-      }
-      
-      if (newConflicts.length > 0) {
-        setConflicts(newConflicts);
-        setShowConflictDialog(true);
       }
     } catch (err) {
       console.error('Failed to start step:', err);
@@ -291,47 +345,25 @@ const ExperimentRunner: React.FC = () => {
     }
   };
 
-  const handleStepComplete = async (stepId: string) => {
-    if (!experiment) return;
-    
-    try {
-      const updatedExperiment = await apiClient.completeStep(stepId);
-      setExperiment(updatedExperiment);
-      
-      // Find next READY step and set as active
-      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
-      if (nextReadyIndex !== -1) {
-        setActiveStepIndex(nextReadyIndex);
-      } else {
-        // No more ready steps
-        setActiveStepIndex(null);
-      }
-    } catch (err) {
-      console.error('Failed to complete step:', err);
-      alert('Failed to complete step. Please try again.');
-    }
-  };
+  // ``handleStepComplete`` lives near the top of the component as a stable
+  // useCallback so the per-second tick effect can reference it without
+  // re-creating the interval. See the comment block above the timer effect.
 
   const handleStepSkip = async (stepId: string) => {
     if (!experiment) return;
-    
+
+    // Server-sourced state: POST /api/steps/<id>/skip and let the resulting
+    // ``experiment_update`` socket push (or the HTTP response) update local
+    // state. Don't optimistically mutate ``experiment`` here -- doing that
+    // is what lets two tabs of the same experiment drift, and what made the
+    // pre-U5 client think a step was SKIPPED while the server still had it
+    // RUNNING.
     try {
-      // For now, just mark as completed in UI
-      // In a real app, there would be a skip endpoint
-      const updatedSteps = experiment.steps.map(step => {
-        if (step.id === stepId) {
-          return {
-            ...step,
-            status: StepStatus.SKIPPED
-          };
-        }
-        return step;
-      });
-      
-      setExperiment({...experiment, steps: updatedSteps});
-      
+      const updatedExperiment = await apiClient.skipStep(stepId);
+      setExperiment(updatedExperiment);
+
       // Find next READY step and set as active
-      const nextReadyIndex = updatedSteps.findIndex(step => step.status === StepStatus.READY);
+      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
       if (nextReadyIndex !== -1) {
         setActiveStepIndex(nextReadyIndex);
       } else {
@@ -372,14 +404,25 @@ const ExperimentRunner: React.FC = () => {
 
   const formatTime = (seconds?: number) => {
     if (seconds === undefined) return '--:--';
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const safe = Math.max(0, Math.floor(seconds));
+    const mins = Math.floor(safe / 60);
+    const secs = safe % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Convert duration_seconds -> human-readable minutes for the static labels.
+  // Sub-minute durations show "<1 min" so a 30-second step doesn't render as
+  // "0 min" (the audit's // 60 truncation bug, surfaced visually).
+  const formatDurationMinutes = (seconds: number): string => {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '0 min';
+    if (seconds < 60) return '<1 min';
+    return `${Math.floor(seconds / 60)} min`;
+  };
+
   const getProgress = (step: Step) => {
-    if (!step.elapsedTime || step.type === StepType.TASK) return 0;
-    const progress = (step.elapsedTime / (step.duration * 60)) * 100;
+    if (!step.elapsed_seconds || step.step_type === StepType.TASK) return 0;
+    if (!step.duration_seconds || step.duration_seconds <= 0) return 0;
+    const progress = (step.elapsed_seconds / step.duration_seconds) * 100;
     return Math.min(progress, 100);
   };
 
@@ -501,14 +544,14 @@ const ExperimentRunner: React.FC = () => {
                 <Grid container spacing={2}>
                   <Grid item xs={12} md={6}>
                     <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Type: {activeStep.type.replace('_', ' ')}
+                      Type: {activeStep.step_type.replace('_', ' ')}
                     </Typography>
                     <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Duration: {activeStep.duration} minutes
+                      Duration: {formatDurationMinutes(activeStep.duration_seconds)}
                     </Typography>
-                    {activeStep.resourceNeeded && (
+                    {activeStep.resource_required && (
                       <Typography variant="body2" color="text.secondary" gutterBottom>
-                        Resource: {activeStep.resourceNeeded}
+                        Resource: {activeStep.resource_required}
                       </Typography>
                     )}
                     {activeStep.notes && (
@@ -523,14 +566,14 @@ const ExperimentRunner: React.FC = () => {
                         <Box sx={{ display: 'flex', alignItems: 'center' }}>
                           <TimerIcon sx={{ mr: 1 }} />
                           <Typography variant="h6">
-                            {formatTime(activeStep.elapsedTime)}
+                            {formatTime(activeStep.elapsed_seconds)}
                           </Typography>
                         </Box>
-                        
-                        {activeStep.type !== StepType.TASK && (
-                          <LinearProgress 
-                            variant="determinate" 
-                            value={getProgress(activeStep)} 
+
+                        {activeStep.step_type !== StepType.TASK && (
+                          <LinearProgress
+                            variant="determinate"
+                            value={getProgress(activeStep)}
                             sx={{ height: 10, mt: 1 }}
                           />
                         )}
@@ -553,7 +596,7 @@ const ExperimentRunner: React.FC = () => {
                 
                 {activeStep.status === StepStatus.RUNNING && (
                   <>
-                    {activeStep.type === StepType.TASK && (
+                    {activeStep.step_type === StepType.TASK && (
                       <Button 
                         color="warning" 
                         variant="contained"
@@ -611,6 +654,23 @@ const ExperimentRunner: React.FC = () => {
           </Box>
         )}
         
+        {/* Resource conflict warnings (U6). Non-blocking on purpose: the
+            previous dialog interrupted the user's flow on every Start click.
+            The server's check_for_conflicts powers this list, so it stays
+            consistent with whatever U7 will use to fire notifications. */}
+        {conflicts.length > 0 && (
+          <Alert severity="warning" sx={{ mb: 3 }}>
+            <Typography variant="subtitle2" gutterBottom>
+              Resource conflicts detected ({conflicts.length}):
+            </Typography>
+            {conflicts.map((c) => (
+              <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
+                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+              </Typography>
+            ))}
+          </Alert>
+        )}
+
         {/* Steps List */}
         <Box sx={{ mb: 4 }}>
           <Typography variant="h5" gutterBottom>
@@ -625,7 +685,7 @@ const ExperimentRunner: React.FC = () => {
                     <Box>
                       {step.status === StepStatus.RUNNING && (
                         <Typography variant="body2" color="text.secondary" sx={{ mr: 2 }}>
-                          {formatTime(step.elapsedTime)}
+                          {formatTime(step.elapsed_seconds)}
                         </Typography>
                       )}
                       {getStepStatusChip(step.status)}
@@ -636,7 +696,7 @@ const ExperimentRunner: React.FC = () => {
                 >
                   <ListItemText
                     primary={`${index + 1}. ${step.name}`}
-                    secondary={`Type: ${step.type.replace('_', ' ')} | Duration: ${step.duration} min | Resource: ${step.resourceNeeded || 'none'}`}
+                    secondary={`Type: ${step.step_type.replace('_', ' ')} | Duration: ${formatDurationMinutes(step.duration_seconds)} | Resource: ${step.resource_required || 'none'}`}
                   />
                 </ListItem>
               </React.Fragment>
@@ -644,37 +704,6 @@ const ExperimentRunner: React.FC = () => {
           </List>
         </Box>
       </Box>
-      
-      {/* Conflict Dialog */}
-      <Dialog
-        open={showConflictDialog}
-        onClose={() => setShowConflictDialog(false)}
-      >
-        <DialogTitle>Resource Conflict Detected</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            The following steps are trying to use the same resources at the same time:
-          </DialogContentText>
-          <List>
-            {conflicts.map((conflict, index) => (
-              <ListItem key={index}>
-                <ListItemText
-                  primary={`Conflict: ${conflict.step1.name} and ${conflict.step2.name}`}
-                  secondary={`Both need ${conflict.step1.resourceNeeded}`}
-                />
-              </ListItem>
-            ))}
-          </List>
-          <DialogContentText>
-            Consider pausing one of the steps or rescheduling.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setShowConflictDialog(false)}>
-            Acknowledge
-          </Button>
-        </DialogActions>
-      </Dialog>
       
       {/* Step Info Dialog */}
       <Dialog
@@ -687,17 +716,17 @@ const ExperimentRunner: React.FC = () => {
             <>
               <Typography variant="h6" gutterBottom>{selectedStep.name}</Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Type:</strong> {selectedStep.type.replace('_', ' ')}
+                <strong>Type:</strong> {selectedStep.step_type.replace('_', ' ')}
               </Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Duration:</strong> {selectedStep.duration} minutes
+                <strong>Duration:</strong> {formatDurationMinutes(selectedStep.duration_seconds)}
               </Typography>
               <Typography variant="body2" gutterBottom>
                 <strong>Status:</strong> {selectedStep.status}
               </Typography>
-              {selectedStep.resourceNeeded && (
+              {selectedStep.resource_required && (
                 <Typography variant="body2" gutterBottom>
-                  <strong>Resource Needed:</strong> {selectedStep.resourceNeeded}
+                  <strong>Resource Needed:</strong> {selectedStep.resource_required}
                 </Typography>
               )}
               {selectedStep.dependencies.length > 0 && (
@@ -714,14 +743,14 @@ const ExperimentRunner: React.FC = () => {
                 </Typography>
               )}
               <Typography variant="body2" gutterBottom>
-                <strong>Scheduled Start:</strong> {formatDateTime(selectedStep.scheduledStartTime)}
+                <strong>Scheduled Start:</strong> {formatDateTime(selectedStep.scheduled_start_time)}
               </Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Actual Start:</strong> {formatDateTime(selectedStep.actualStartTime)}
+                <strong>Actual Start:</strong> {formatDateTime(selectedStep.actual_start_time)}
               </Typography>
-              {selectedStep.actualEndTime && (
+              {selectedStep.actual_end_time && (
                 <Typography variant="body2" gutterBottom>
-                  <strong>Actual End:</strong> {formatDateTime(selectedStep.actualEndTime)}
+                  <strong>Actual End:</strong> {formatDateTime(selectedStep.actual_end_time)}
                 </Typography>
               )}
             </>

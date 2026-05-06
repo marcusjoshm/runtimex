@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
 import json
 
+from db import db
+
 # Define notification types
 class NotificationType(Enum):
     STEP_READY = "step_ready"
@@ -138,11 +140,15 @@ class Notification:
 
 # Notification service
 class NotificationService:
+    """Notification storage + delivery, backed by NotificationORM.
+
+    The legacy ``create_notification`` method name is kept for compatibility
+    with `main.py`. Internally it delegates to ``add_notification``.
+    """
+
     def __init__(self, socketio=None):
-        self.notifications: Dict[str, Notification] = {}  # id -> notification
-        self.user_notifications: Dict[str, List[str]] = {}  # username -> [notification_ids]
         self.socketio = socketio
-        
+
         # Register notification handlers for different step types
         self.notification_handlers = {
             NotificationType.STEP_READY: self._handle_step_ready,
@@ -154,75 +160,138 @@ class NotificationService:
             NotificationType.ERROR: self._handle_error,
             # GENERAL_INFO and CUSTOM don't need special handling
         }
-    
-    def create_notification(self, notification: Notification) -> str:
-        """Create a new notification and store it"""
-        self.notifications[notification.id] = notification
-        
-        # Associate with users
+
+    # ------------------------------------------------------------------
+    # ORM <-> Notification conversion
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _orm_to_notification(orm) -> 'Notification':
+        n = Notification(
+            title=orm.title,
+            message=orm.message,
+            notification_type=NotificationType(orm.type),
+            priority=NotificationPriority(orm.priority),
+            target_users=[orm.target_user],
+            experiment_id=orm.experiment_id,
+            step_id=orm.step_id,
+            metadata=dict(orm.notification_metadata or {}),
+            delivery_methods=[DeliveryMethod(m) for m in (orm.delivery_methods or ['in_app'])],
+        )
+        n.id = orm.id
+        n.created_at = orm.created_at
+        n.is_read = orm.is_read
+        n.is_dismissed = orm.is_dismissed
+        for action_data in (orm.actions or []):
+            n.actions.append(NotificationAction(
+                action_id=action_data['id'],
+                action_type=ActionType(action_data['type']),
+                label=action_data['label'],
+                data=action_data.get('data', {}),
+            ))
+        return n
+
+    @staticmethod
+    def _notification_to_orm_rows(notification: 'Notification') -> List:
+        """Build one NotificationORM row per target_user.
+
+        We fan out per-user so the ``target_user`` column can be a simple
+        FK + index. The notification id is shared across rows so callers can
+        still treat it as "the" notification id; mark/dismiss/delete update
+        every row with that id.
+        """
+        from models import NotificationORM
+        rows = []
         for user in notification.target_users:
-            if user not in self.user_notifications:
-                self.user_notifications[user] = []
-            self.user_notifications[user].append(notification.id)
-        
-        # Execute the handler for this notification type
+            rows.append(NotificationORM(
+                id=notification.id,
+                target_user=user,
+                title=notification.title,
+                message=notification.message,
+                type=notification.type.value,
+                priority=notification.priority.value,
+                experiment_id=notification.experiment_id,
+                step_id=notification.step_id,
+                notification_metadata=dict(notification.metadata or {}),
+                actions=[a.to_dict() for a in notification.actions],
+                delivery_methods=[m.value for m in notification.delivery_methods],
+                created_at=notification.created_at,
+                is_read=notification.is_read,
+                is_dismissed=notification.is_dismissed,
+            ))
+        return rows
+
+    # ------------------------------------------------------------------
+    # Public API (back-compat names preserved)
+    # ------------------------------------------------------------------
+    def add_notification(self, notification: Notification) -> str:
+        """Persist a notification + emit on socket. Replaces old in-memory dict."""
+        from models import NotificationORM
+
+        # Run type-specific handler first (may mutate notification.actions etc.)
         if notification.type in self.notification_handlers:
             self.notification_handlers[notification.type](notification)
-        
-        # Send real-time update via WebSocket if available
+
+        rows = self._notification_to_orm_rows(notification)
+        for row in rows:
+            db.session.add(row)
+        db.session.commit()
+
         if self.socketio:
             for user in notification.target_users:
                 self.socketio.emit(
-                    'notification', 
-                    notification.to_dict(), 
+                    'notification',
+                    notification.to_dict(),
                     room=f'user_{user}'
                 )
-        
+
         return notification.id
-    
+
+    # Legacy alias used by main.py and the notification factories.
+    def create_notification(self, notification: Notification) -> str:
+        return self.add_notification(notification)
+
     def get_user_notifications(self, username: str, unread_only: bool = False) -> List[Notification]:
-        """Get all notifications for a user"""
-        notification_ids = self.user_notifications.get(username, [])
-        result = []
-        
-        for nid in notification_ids:
-            if nid in self.notifications:
-                notification = self.notifications[nid]
-                if not unread_only or not notification.is_read:
-                    result.append(notification)
-        
-        # Sort by creation time (newest first)
-        result.sort(key=lambda n: n.created_at, reverse=True)
-        return result
-    
+        """Get all notifications for a user, newest first."""
+        from models import NotificationORM
+
+        q = NotificationORM.query.filter_by(target_user=username)
+        if unread_only:
+            q = q.filter_by(is_read=False)
+        rows = q.order_by(NotificationORM.created_at.desc()).all()
+        return [self._orm_to_notification(r) for r in rows]
+
     def mark_as_read(self, notification_id: str) -> bool:
-        """Mark a notification as read"""
-        if notification_id in self.notifications:
-            self.notifications[notification_id].is_read = True
-            return True
-        return False
-    
+        from models import NotificationORM
+
+        rows = NotificationORM.query.filter_by(id=notification_id).all()
+        if not rows:
+            return False
+        for r in rows:
+            r.is_read = True
+        db.session.commit()
+        return True
+
     def mark_as_dismissed(self, notification_id: str) -> bool:
-        """Mark a notification as dismissed"""
-        if notification_id in self.notifications:
-            self.notifications[notification_id].is_dismissed = True
-            return True
-        return False
-    
+        from models import NotificationORM
+
+        rows = NotificationORM.query.filter_by(id=notification_id).all()
+        if not rows:
+            return False
+        for r in rows:
+            r.is_dismissed = True
+        db.session.commit()
+        return True
+
     def delete_notification(self, notification_id: str) -> bool:
-        """Delete a notification"""
-        if notification_id in self.notifications:
-            notification = self.notifications[notification_id]
-            
-            # Remove from user associations
-            for user in notification.target_users:
-                if user in self.user_notifications and notification_id in self.user_notifications[user]:
-                    self.user_notifications[user].remove(notification_id)
-            
-            # Remove the notification
-            del self.notifications[notification_id]
-            return True
-        return False
+        from models import NotificationORM
+
+        rows = NotificationORM.query.filter_by(id=notification_id).all()
+        if not rows:
+            return False
+        for r in rows:
+            db.session.delete(r)
+        db.session.commit()
+        return True
     
     # --- Notification Type Handlers ---
     
