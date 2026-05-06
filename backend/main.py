@@ -1,13 +1,25 @@
 from datetime import datetime, timedelta
-import time # For simulating delays (optional)
 import json
+import logging
 import os
 import tempfile
+import uuid
+
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from flask_socketio import SocketIO, join_room, leave_room
-from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
-import uuid
+from flask_socketio import SocketIO, join_room
+from flask_jwt_extended import (
+    JWTManager,
+    jwt_required,
+    get_jwt_identity,
+    verify_jwt_in_request,
+)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from models import Experiment, Step, StepStatus, StepType
 from scheduler import Scheduler
@@ -15,6 +27,8 @@ import auth
 
 # Import notification system
 from notifications import NotificationService, Notification, NotificationType, NotificationPriority, ActionType, NotificationAction, create_notification_factories
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -25,8 +39,15 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Global scheduler instance to maintain state
 scheduler = Scheduler()
 
-# Add after app creation
-app.config["JWT_SECRET_KEY"] = "your-secret-key-change-in-production"
+_JWT_DEV_FALLBACK = "dev-only-insecure-secret-do-not-use-in-production"
+jwt_secret = os.environ.get("JWT_SECRET_KEY")
+if not jwt_secret:
+    logger.warning(
+        "JWT_SECRET_KEY not set in environment; using insecure dev fallback. "
+        "Set JWT_SECRET_KEY before deploying."
+    )
+    jwt_secret = _JWT_DEV_FALLBACK
+app.config["JWT_SECRET_KEY"] = jwt_secret
 jwt = JWTManager(app)
 
 # Initialize auth routes and get the user getter function
@@ -612,12 +633,19 @@ def delete_notification(notification_id):
 # WebSocket event handlers for notifications
 @socketio.on('connect')
 def handle_connect():
-    print('Client connected')
-    
-    # Add user to their own room for targeted notifications
-    user = get_jwt_identity() if request.args.get('token') else None
-    if user:
-        join_room(f'user_{user}')
+    """Validate the JWT (passed via query string by socket.io clients) and join the user room."""
+    try:
+        verify_jwt_in_request(locations=['query_string'])
+        username = get_jwt_identity()
+    except Exception:
+        username = None
+
+    if username:
+        join_room(f'user_{username}')
+        print(f'Client connected: user_{username}')
+    else:
+        print('Client connected (unauthenticated)')
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -685,108 +713,14 @@ def check_resource_conflicts():
             else:
                 running_resources[step.resource_needed] = step
 
-# --- Main Test Function --- 
-def run_test():
-    print("--- Starting Lab Timer Test Scenario ---")
-
-    # 1. Create Steps for Dish 1
-    pretreat = Step(
-        name="Dish 1: Pretreat D1",
-        duration=timedelta(minutes=30),
-        step_type=StepType.FIXED_DURATION
-    )
-    treat = Step(
-        name="Dish 1: Treat D2",
-        duration=timedelta(minutes=60),
-        step_type=StepType.FIXED_DURATION,
-        dependencies=[pretreat.id]
-    )
-    wash = Step(
-        name="Dish 1: Wash",
-        duration=timedelta(minutes=4),
-        step_type=StepType.TASK, # Pausable task
-        dependencies=[treat.id]
-    )
-    recover = Step(
-        name="Dish 1: Recover",
-        duration=timedelta(minutes=60),
-        step_type=StepType.FIXED_START,
-        dependencies=[wash.id]
-    )
-    image_setup = Step(
-        name="Dish 1: Setup Imaging",
-        duration=timedelta(minutes=5),
-        step_type=StepType.TASK,
-        dependencies=[recover.id],
-        resource_needed='user_attention'
-    )
-    image_capture = Step(
-        name="Dish 1: Image Capture",
-        duration=timedelta(minutes=20),
-        step_type=StepType.AUTOMATED_TASK,
-        dependencies=[image_setup.id],
-        resource_needed='microscope'
-    )
-
-    # 2. Create Experiment and Add Steps
-    experiment_d1 = Experiment(name="Dish 1 Processing")
-    experiment_d1.add_step(pretreat)
-    experiment_d1.add_step(treat)
-    experiment_d1.add_step(wash)
-    experiment_d1.add_step(recover)
-    experiment_d1.add_step(image_setup)
-    experiment_d1.add_step(image_capture)
-
-    # 3. Add Experiment to Scheduler
-    scheduler.add_experiment(experiment_d1)
-
-    # 4. Calculate Initial Schedule (starting now)
-    start_time = datetime.now()
-    print(f"\nCalculating initial schedule starting around: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    scheduler.calculate_initial_schedule(start_time=start_time)
-
-    # 5. Print Initial Schedule
-    print_schedule(scheduler)
-
-    # 6. Simulate Running the First Step
-    print("--- Simulating Experiment Execution ---")
-
-    # Find the first ready step
-    first_step_id = None
-    for step_id, step in scheduler.schedule.items():
-        if step.status == StepStatus.READY:
-            first_step_id = step_id
-            print(f"Found ready step: {step.name}")
-            break
-
-    if not first_step_id:
-        print("Error: No step found in READY state after initial scheduling.")
-        return
-
-    # Start the first step
-    print(f"\nStarting step: {scheduler.get_step(first_step_id).name}")
-    start_event_time = datetime.now() # Simulate user pressing start
-    scheduler.handle_step_start(first_step_id, start_time=start_event_time)
-    print_schedule(scheduler)
-
-    # Simulate time passing until the first step is done
-    # For this test, we'll just complete it immediately after starting
-    # In reality, this would happen after pretreat.duration has passed
-    print(f"Simulating completion of step: {scheduler.get_step(first_step_id).name}")
-    # We use the original start time + duration to simulate ideal completion
-    completion_time = start_event_time + pretreat.duration
-    scheduler.handle_step_complete(first_step_id, end_time=completion_time)
-
-    # 7. Print Schedule Again to See Status Updates
-    print("\n--- Schedule after completing first step ---")
-    print_schedule(scheduler)
-
-    print("--- Test Scenario Complete ---")
-
 if __name__ == "__main__":
-    # If run directly, run the test scenario
-    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        run_test()
-    
-    # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000
-    socketio.run(app, debug=True, port=5001, host='0.0.0.0')
+    # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000.
+    # allow_unsafe_werkzeug=True is required by Flask-SocketIO 5.x in dev mode when no
+    # eventlet/gevent worker is installed. Production deployments should switch to one.
+    socketio.run(
+        app,
+        debug=True,
+        port=5001,
+        host='0.0.0.0',
+        allow_unsafe_werkzeug=True,
+    )
