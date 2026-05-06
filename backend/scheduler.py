@@ -332,9 +332,9 @@ class Scheduler:
 
         Algorithm:
 
-        1. Collect ``(step_id, step_name, resource, start, end)`` tuples for
-           every step where ``resource_needed`` is non-empty AND both
-           scheduled times are present.
+        1. Collect ``(step_id, step_name, condition_id, resource, start, end)``
+           tuples for every step where ``resource_needed`` is non-empty AND
+           both scheduled times are present.
         2. Group by resource, sort each group by ``start``.
         3. Walk pairwise within a group; emit a conflict for each pair whose
            half-open intervals overlap (``a.start < b.end and b.start < a.end``).
@@ -345,14 +345,26 @@ class Scheduler:
 
         Returns:
             A list of dicts, one per overlapping pair:
-            ``{step_a, step_b, resource, overlap_seconds, step_a_name, step_b_name}``.
+            ``{step_a, step_b, resource, overlap_seconds, step_a_name,
+            step_b_name, condition_a_id, condition_a_name, condition_b_id,
+            condition_b_name}``.
             ``overlap_seconds`` is an integer (rounded down) so the wire shape
             stays small. The names are included so the frontend can render
-            without re-resolving step IDs.
+            without re-resolving step IDs. Condition labels (added in U2) let
+            the Designer / Runner surface "Condition A: Image ↔ Condition B:
+            Image" without a second lookup.
+
+            Defensive: if a step's ``condition_id`` is missing from
+            ``experiment.conditions`` (e.g. mid-edit, race with a deletion),
+            ``condition_*_name`` is reported as ``"Unknown"`` and
+            ``condition_*_id`` is the step's raw ``condition_id`` (or
+            ``None``). The detector never crashes on missing condition data.
         """
+        conditions_by_id = getattr(experiment, "conditions", {}) or {}
+
         # 1. Collect candidates. Skip anything missing a resource or a
         #    scheduled window -- those can't participate in a real conflict.
-        candidates: List[Tuple[str, str, str, datetime, datetime]] = []
+        candidates: List[Tuple[str, str, Optional[str], str, datetime, datetime]] = []
         for step in experiment.steps.values():
             resource = step.resource_needed
             if not resource:  # None or empty string
@@ -361,26 +373,42 @@ class Scheduler:
             end = step.scheduled_end_time
             if start is None or end is None:
                 continue
-            candidates.append((step.id, step.name, resource, start, end))
+            candidates.append(
+                (step.id, step.name, getattr(step, "condition_id", None), resource, start, end)
+            )
 
         if not candidates:
             return []
 
         # 2. Group by resource.
-        by_resource: Dict[str, List[Tuple[str, str, str, datetime, datetime]]] = {}
+        by_resource: Dict[str, List[Tuple[str, str, Optional[str], str, datetime, datetime]]] = {}
         for entry in candidates:
-            by_resource.setdefault(entry[2], []).append(entry)
+            by_resource.setdefault(entry[3], []).append(entry)
 
         conflicts: List[Dict[str, object]] = []
 
+        def _condition_name(cid: Optional[str]) -> str:
+            """Look up a Condition's display name from the experiment cache.
+
+            Falls back to ``"Unknown"`` for any cid that doesn't resolve --
+            either ``None`` (legacy data the backfill missed) or a stale FK.
+            Never raises; conflict reporting must survive partial data.
+            """
+            if not cid:
+                return "Unknown"
+            cond = conditions_by_id.get(cid)
+            if cond is None:
+                return "Unknown"
+            return cond.name
+
         # 3. Pairwise overlap check within each group.
         for resource, entries in by_resource.items():
-            entries.sort(key=lambda e: e[3])  # sort by start
+            entries.sort(key=lambda e: e[4])  # sort by start
             n = len(entries)
             for i in range(n):
-                a_id, a_name, _, a_start, a_end = entries[i]
+                a_id, a_name, a_cond_id, _, a_start, a_end = entries[i]
                 for j in range(i + 1, n):
-                    b_id, b_name, _, b_start, b_end = entries[j]
+                    b_id, b_name, b_cond_id, _, b_start, b_end = entries[j]
                     # Sorted by start, so a_start <= b_start. Once b_start
                     # is at or past a_end there's no further overlap with i.
                     if b_start >= a_end:
@@ -403,6 +431,11 @@ class Scheduler:
                             "overlap_seconds": overlap_seconds,
                             "step_a_name": a_name,
                             "step_b_name": b_name,
+                            # Condition labels (U2). Defensive: missing FK -> "Unknown".
+                            "condition_a_id": a_cond_id,
+                            "condition_a_name": _condition_name(a_cond_id),
+                            "condition_b_id": b_cond_id,
+                            "condition_b_name": _condition_name(b_cond_id),
                         })
         return conflicts
 

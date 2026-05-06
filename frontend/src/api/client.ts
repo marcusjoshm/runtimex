@@ -28,6 +28,24 @@ export interface Step {
   // this field is the cross-pause source of truth and is used for display
   // when a step is PAUSED.
   elapsed_seconds?: number;
+  // Condition this step belongs to. Always present for persisted steps once
+  // U1 is shipped; legacy data is auto-backfilled to a "Main" Condition.
+  condition_id?: string;
+}
+
+// Condition: a named grouping of steps within an Experiment. Multiple
+// conditions run in parallel (e.g. "Dish 1 / Dish 2 / Dish 3"), can share
+// resources, and can drift in shape from each other. The `color` is one of
+// the 10 predefined palette keys (slate, coral, forest, lavender, amber,
+// teal, magenta, mint, navy, gold) -- see ConditionPaletteSwatch.tsx for the
+// canonical list and the MUI mapping.
+export interface Condition {
+  id: string;
+  experiment_id: string;
+  name: string;
+  color: string;
+  order_index: number;
+  description?: string;
 }
 
 export interface Experiment {
@@ -35,6 +53,9 @@ export interface Experiment {
   name: string;
   description: string;
   steps: Step[];
+  // U1 ships this as a sibling array on the wire. Optional in the type so
+  // legacy mock data and partial-update payloads still type-check.
+  conditions?: Condition[];
   owner?: string;
   shared_with?: Record<string, string>; // username -> permission
 }
@@ -50,6 +71,14 @@ export interface Conflict {
   overlap_seconds: number;
   step_a_name: string;
   step_b_name: string;
+  // Condition labels (U2). Always populated server-side; the name falls back
+  // to "Unknown" when the step's condition_id can't be resolved against the
+  // experiment's Condition cache (defensive against mid-edit race / legacy
+  // data). condition_*_id may be null for pre-U1 steps that escaped backfill.
+  condition_a_id?: string | null;
+  condition_a_name: string;
+  condition_b_id?: string | null;
+  condition_b_name: string;
 }
 
 // Response shape for createExperiment / updateExperiment. The PUT path

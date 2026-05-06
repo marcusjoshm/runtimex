@@ -665,7 +665,7 @@ const ExperimentRunner: React.FC = () => {
             </Typography>
             {conflicts.map((c) => (
               <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
-                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+                {c.step_a_name} ({c.condition_a_name}) ↔ {c.step_b_name} ({c.condition_b_name}) on {c.resource} ({c.overlap_seconds}s overlap)
               </Typography>
             ))}
           </Alert>

@@ -4,6 +4,7 @@ import {
   Alert,
   Box,
   Button,
+  Chip,
   CircularProgress,
   Container,
   TextField,
@@ -23,8 +24,10 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
+  DialogContentText,
   FormHelperText,
-  SelectChangeEvent
+  SelectChangeEvent,
+  Stack,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -32,7 +35,14 @@ import EditIcon from '@mui/icons-material/Edit';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import SaveIcon from '@mui/icons-material/Save';
-import apiClient, { Experiment as ApiExperiment, Step as ApiStep, Conflict } from '../api/client';
+import apiClient, {
+  Experiment as ApiExperiment,
+  Step as ApiStep,
+  Condition as ApiCondition,
+  Conflict,
+} from '../api/client';
+import ConditionEditor from '../components/ConditionEditor';
+import { getPaletteColor } from '../components/ConditionPaletteSwatch';
 
 // Local Step shape used by the Designer's UI state. The form lets the user
 // enter duration in MINUTES (which is the natural unit when designing a
@@ -49,6 +59,10 @@ interface Step {
   dependencies: string[];
   notes?: string;
   resource_required?: string;
+  // Each Step belongs to exactly one Condition. We default new Steps to the
+  // currently-first Condition (or a Main Condition we'll auto-create) so the
+  // user never has to pick on every Add Step click.
+  condition_id: string;
 }
 
 interface Experiment {
@@ -56,25 +70,68 @@ interface Experiment {
   name: string;
   description: string;
   steps: Step[];
+  // Conditions live here in local state too -- the user can add/edit/reorder
+  // them in the form and we send the whole array on save (U1's wire shape).
+  conditions: ApiCondition[];
 }
 
 const newLocalId = () => Math.random().toString(36).substring(2, 9);
+
+// Build a fresh Condition dataclass for the Designer's local state. We make
+// up an ID client-side so the user can immediately reference it from new
+// Steps' condition_id without waiting for a save round-trip; the backend
+// upserts by ID so the value sticks across the POST/PUT.
+const newCondition = (
+  experimentId: string,
+  defaults: Partial<ApiCondition> = {}
+): ApiCondition => ({
+  id: defaults.id ?? newLocalId(),
+  experiment_id: experimentId,
+  name: defaults.name ?? '',
+  color: defaults.color ?? 'slate',
+  order_index: defaults.order_index ?? 0,
+  description: defaults.description,
+});
 
 const ExperimentDesigner: React.FC = () => {
   const navigate = useNavigate();
   const { id: experimentId } = useParams<{ id?: string }>();
   const isEditing = Boolean(experimentId);
 
+  // The local experiment state always has at least one Condition. If the
+  // user is creating a brand-new Experiment we seed with a default "Main"
+  // Condition so the per-step Condition dropdown is never empty.
+  const initialExperimentId = experimentId || newLocalId();
   const [experiment, setExperiment] = useState<Experiment>({
-    id: experimentId || newLocalId(),
+    id: initialExperimentId,
     name: '',
     description: '',
-    steps: []
+    steps: [],
+    conditions: [
+      newCondition(initialExperimentId, { name: 'Main', color: 'slate', order_index: 0 }),
+    ],
   });
 
   const [openStepDialog, setOpenStepDialog] = useState(false);
   const [currentStep, setCurrentStep] = useState<Step | null>(null);
   const [editStepIndex, setEditStepIndex] = useState<number | null>(null);
+
+  // Condition editor state. `conditionDraft` is the value passed into
+  // <ConditionEditor>; `editingConditionIndex` tells us whether to update
+  // an existing Condition (-1 = adding new) on save.
+  const [openConditionDialog, setOpenConditionDialog] = useState(false);
+  const [conditionDraft, setConditionDraft] = useState<ApiCondition | null>(null);
+  const [editingConditionIndex, setEditingConditionIndex] = useState<number>(-1);
+
+  // Cross-condition Step-move confirmation dialog. When the user changes a
+  // Step's Condition while it has dependencies, we stash the pending change
+  // here, ask "are you sure (deps will be stripped)?", and apply on confirm.
+  // Cancel reverts the dropdown to the previous condition_id.
+  const [conditionMoveConfirm, setConditionMoveConfirm] = useState<{
+    fromConditionId: string;
+    toConditionId: string;
+    dependencyCount: number;
+  } | null>(null);
 
   const [loading, setLoading] = useState<boolean>(isEditing);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -105,10 +162,29 @@ const ExperimentDesigner: React.FC = () => {
     apiClient.getExperiment(experimentId)
       .then((data: ApiExperiment) => {
         if (cancelled) return;
+        // Server-side every persisted experiment has at least one Condition
+        // (U1 backfill ensures Main exists). But guard against an empty
+        // payload anyway so the dropdown isn't blank for a corrupt fetch.
+        const loadedConditions: ApiCondition[] = (data.conditions ?? []).slice().sort(
+          (a, b) => a.order_index - b.order_index
+        );
+        const conditionsToUse: ApiCondition[] =
+          loadedConditions.length > 0
+            ? loadedConditions
+            : [
+                newCondition(data.id, {
+                  name: 'Main',
+                  color: 'slate',
+                  order_index: 0,
+                }),
+              ];
+        const fallbackConditionId = conditionsToUse[0].id;
+
         setExperiment({
           id: data.id,
           name: data.name || '',
           description: data.description || '',
+          conditions: conditionsToUse,
           steps: (data.steps || []).map((s: ApiStep) => ({
             id: s.id,
             name: s.name,
@@ -122,6 +198,7 @@ const ExperimentDesigner: React.FC = () => {
             dependencies: s.dependencies || [],
             notes: s.notes,
             resource_required: s.resource_required,
+            condition_id: s.condition_id || fallbackConditionId,
           })),
         });
       })
@@ -138,20 +215,118 @@ const ExperimentDesigner: React.FC = () => {
     };
   }, [experimentId]);
 
+  // ------------------------------------------------------------------
+  // Condition handlers
+  // ------------------------------------------------------------------
+  const handleAddCondition = () => {
+    const nextOrder = experiment.conditions.length;
+    setConditionDraft(
+      newCondition(experiment.id, {
+        name: '',
+        color: 'slate',
+        order_index: nextOrder,
+      })
+    );
+    setEditingConditionIndex(-1);
+    setOpenConditionDialog(true);
+  };
+
+  const handleEditCondition = (index: number) => {
+    setConditionDraft({ ...experiment.conditions[index] });
+    setEditingConditionIndex(index);
+    setOpenConditionDialog(true);
+  };
+
+  const handleSaveCondition = (saved: ApiCondition) => {
+    setExperiment((prev) => {
+      const conditions = [...prev.conditions];
+      if (editingConditionIndex >= 0) {
+        conditions[editingConditionIndex] = saved;
+      } else {
+        conditions.push(saved);
+      }
+      return { ...prev, conditions };
+    });
+    setOpenConditionDialog(false);
+    setConditionDraft(null);
+    setEditingConditionIndex(-1);
+  };
+
+  const handleDeleteCondition = (index: number) => {
+    const condition = experiment.conditions[index];
+    if (!condition) return;
+    // Refuse to delete the last Condition -- every Step needs to belong
+    // somewhere, and the backend rejects an empty-Conditions experiment.
+    if (experiment.conditions.length <= 1) {
+      setSaveError('At least one Condition is required.');
+      return;
+    }
+    // Refuse to delete a Condition that still has Steps assigned. The user
+    // must move them out first; auto-reassigning to a sibling would silently
+    // mix protocols, which is exactly what Conditions exist to prevent.
+    const stepsInCondition = experiment.steps.filter(
+      (s) => s.condition_id === condition.id
+    );
+    if (stepsInCondition.length > 0) {
+      setSaveError(
+        `Cannot delete "${condition.name}" -- ${stepsInCondition.length} step(s) still belong to it. Move or delete them first.`
+      );
+      return;
+    }
+    setSaveError(null);
+    setExperiment((prev) => {
+      const conditions = prev.conditions.filter((_, i) => i !== index);
+      // Renumber order_index so subsequent reorder operations stay sensible.
+      conditions.forEach((c, i) => {
+        c.order_index = i;
+      });
+      return { ...prev, conditions };
+    });
+  };
+
+  const handleMoveCondition = (index: number, direction: 'up' | 'down') => {
+    if (
+      (direction === 'up' && index === 0) ||
+      (direction === 'down' && index === experiment.conditions.length - 1)
+    ) {
+      return;
+    }
+    setExperiment((prev) => {
+      const conditions = [...prev.conditions];
+      const targetIndex = direction === 'up' ? index - 1 : index + 1;
+      [conditions[index], conditions[targetIndex]] = [
+        conditions[targetIndex],
+        conditions[index],
+      ];
+      // Re-derive order_index from array position.
+      conditions.forEach((c, i) => {
+        c.order_index = i;
+      });
+      return { ...prev, conditions };
+    });
+  };
+
+  // ------------------------------------------------------------------
+  // Step handlers
+  // ------------------------------------------------------------------
+  const defaultConditionId = (): string =>
+    experiment.conditions[0]?.id ?? '';
+
   const handleAddStep = () => {
     setCurrentStep({
       id: Math.random().toString(36).substring(2, 9),
       name: '',
       step_type: 'fixed_duration',
       duration_minutes: 30,
-      dependencies: []
+      dependencies: [],
+      condition_id: defaultConditionId(),
     });
     setEditStepIndex(null);
     setOpenStepDialog(true);
   };
 
   const handleEditStep = (index: number) => {
-    setCurrentStep({...experiment.steps[index]});
+    setCurrentStep({ ...experiment.steps[index] });
     setEditStepIndex(index);
     setOpenStepDialog(true);
   };
@@ -159,28 +334,28 @@ const ExperimentDesigner: React.FC = () => {
   const handleDeleteStep = (index: number) => {
     const newSteps = [...experiment.steps];
     newSteps.splice(index, 1);
-    
+
     // Update dependencies in other steps
     const deletedStepId = experiment.steps[index].id;
-    const updatedSteps = newSteps.map(step => ({
+    const updatedSteps = newSteps.map((step) => ({
       ...step,
-      dependencies: step.dependencies.filter(id => id !== deletedStepId)
+      dependencies: step.dependencies.filter((id) => id !== deletedStepId),
     }));
-    
-    setExperiment({...experiment, steps: updatedSteps});
+
+    setExperiment({ ...experiment, steps: updatedSteps });
   };
 
   const handleSaveStep = () => {
     if (!currentStep) return;
-    
+
     const newSteps = [...experiment.steps];
     if (editStepIndex !== null) {
       newSteps[editStepIndex] = currentStep;
     } else {
       newSteps.push(currentStep);
     }
-    
-    setExperiment({...experiment, steps: newSteps});
+
+    setExperiment({ ...experiment, steps: newSteps });
     setOpenStepDialog(false);
     setCurrentStep(null);
     setEditStepIndex(null);
@@ -188,28 +363,61 @@ const ExperimentDesigner: React.FC = () => {
 
   const handleMoveStep = (index: number, direction: 'up' | 'down') => {
     if (
-      (direction === 'up' && index === 0) || 
+      (direction === 'up' && index === 0) ||
       (direction === 'down' && index === experiment.steps.length - 1)
     ) {
       return;
     }
-    
+
     const newSteps = [...experiment.steps];
     const targetIndex = direction === 'up' ? index - 1 : index + 1;
-    
+
     [newSteps[index], newSteps[targetIndex]] = [newSteps[targetIndex], newSteps[index]];
-    setExperiment({...experiment, steps: newSteps});
+    setExperiment({ ...experiment, steps: newSteps });
   };
 
   const handleStepDurationChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!currentStep) return;
     const duration_minutes = parseInt(e.target.value, 10) || 0;
-    setCurrentStep({...currentStep, duration_minutes});
+    setCurrentStep({ ...currentStep, duration_minutes });
   };
 
   const handleStepTypeChange = (e: SelectChangeEvent) => {
     if (!currentStep) return;
-    setCurrentStep({...currentStep, step_type: e.target.value});
+    setCurrentStep({ ...currentStep, step_type: e.target.value });
+  };
+
+  // When the user picks a different Condition for the step in the editor:
+  // if the step has dependencies we stash the move and pop a confirmation.
+  // The backend rejects cross-condition deps (U1) so we strip them at the
+  // client to keep the round-trip clean.
+  const handleStepConditionChange = (e: SelectChangeEvent) => {
+    if (!currentStep) return;
+    const newConditionId = e.target.value;
+    if (newConditionId === currentStep.condition_id) return;
+    if (currentStep.dependencies.length > 0) {
+      setConditionMoveConfirm({
+        fromConditionId: currentStep.condition_id,
+        toConditionId: newConditionId,
+        dependencyCount: currentStep.dependencies.length,
+      });
+      return;
+    }
+    setCurrentStep({ ...currentStep, condition_id: newConditionId });
+  };
+
+  const handleConfirmConditionMove = () => {
+    if (!currentStep || !conditionMoveConfirm) return;
+    setCurrentStep({
+      ...currentStep,
+      condition_id: conditionMoveConfirm.toConditionId,
+      dependencies: [],
+    });
+    setConditionMoveConfirm(null);
+  };
+
+  const handleCancelConditionMove = () => {
+    setConditionMoveConfirm(null);
   };
 
   const handleSaveExperiment = async () => {
@@ -226,6 +434,15 @@ const ExperimentDesigner: React.FC = () => {
       );
       return;
     }
+    if (experiment.conditions.length === 0) {
+      setSaveError('At least one Condition is required.');
+      return;
+    }
+    const blankNamedCondition = experiment.conditions.find((c) => !c.name.trim());
+    if (blankNamedCondition) {
+      setSaveError('Every Condition must have a name.');
+      return;
+    }
 
     // Map to the backend's expected shape (snake_case per U8). Duration is
     // converted minutes -> seconds at the wire boundary so the server can
@@ -233,6 +450,13 @@ const ExperimentDesigner: React.FC = () => {
     const payload = {
       name: experiment.name,
       description: experiment.description,
+      conditions: experiment.conditions.map((c, i) => ({
+        id: c.id,
+        name: c.name,
+        color: c.color,
+        order_index: i, // canonicalize order from array position on save
+        description: c.description,
+      })),
       steps: experiment.steps.map((s) => ({
         id: s.id,
         name: s.name,
@@ -241,6 +465,7 @@ const ExperimentDesigner: React.FC = () => {
         dependencies: s.dependencies,
         notes: s.notes,
         resource_required: s.resource_required,
+        condition_id: s.condition_id,
       })),
     };
 
@@ -302,6 +527,28 @@ const ExperimentDesigner: React.FC = () => {
     );
   }
 
+  // Group steps by Condition for the visual layout. We preserve the user's
+  // current step ordering within each Condition (by re-using the original
+  // index for handleMoveStep / handleDeleteStep / handleEditStep so the
+  // existing handlers work unchanged).
+  const stepsByCondition: Array<{ condition: ApiCondition; entries: { step: Step; originalIndex: number }[] }> =
+    experiment.conditions.map((condition) => ({
+      condition,
+      entries: experiment.steps
+        .map((step, originalIndex) => ({ step, originalIndex }))
+        .filter((entry) => entry.step.condition_id === condition.id),
+    }));
+
+  // Steps that belong to a Condition that no longer exists locally (shouldn't
+  // happen via UI flow but be defensive: if the user deletes a Condition
+  // before reassigning a Step we'll show the orphans here so they can fix it).
+  const orphanSteps = experiment.steps
+    .map((step, originalIndex) => ({ step, originalIndex }))
+    .filter(
+      (entry) =>
+        !experiment.conditions.some((c) => c.id === entry.step.condition_id)
+    );
+
   return (
     <Container maxWidth="lg">
       <Box sx={{ my: 4 }}>
@@ -322,7 +569,7 @@ const ExperimentDesigner: React.FC = () => {
             </Typography>
             {conflicts.map((c) => (
               <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
-                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+                {c.step_a_name} ({c.condition_a_name}) ↔ {c.step_b_name} ({c.condition_b_name}) on {c.resource} ({c.overlap_seconds}s overlap)
               </Typography>
             ))}
           </Alert>
@@ -335,7 +582,7 @@ const ExperimentDesigner: React.FC = () => {
                 fullWidth
                 label="Experiment Name"
                 value={experiment.name}
-                onChange={(e) => setExperiment({...experiment, name: e.target.value})}
+                onChange={(e) => setExperiment({ ...experiment, name: e.target.value })}
                 variant="outlined"
                 required
               />
@@ -345,7 +592,7 @@ const ExperimentDesigner: React.FC = () => {
                 fullWidth
                 label="Description"
                 value={experiment.description}
-                onChange={(e) => setExperiment({...experiment, description: e.target.value})}
+                onChange={(e) => setExperiment({ ...experiment, description: e.target.value })}
                 variant="outlined"
                 multiline
                 rows={3}
@@ -353,20 +600,107 @@ const ExperimentDesigner: React.FC = () => {
             </Grid>
           </Grid>
         </Paper>
-        
+
+        {/* Conditions section.
+            Layout choice: above-steps full-width row (rather than a sidebar).
+            Reasons: (1) it follows the natural editing order -- users decide
+            their conditions before they assign steps to them; (2) the
+            existing Designer page is a single-column form, and a true
+            sidebar would force MUI Grid layout changes that fight against
+            the existing Step list rendering; (3) below it we group the Step
+            list by Condition for visual clarity, so the conditions header
+            doubles as a legend for the swimlane-shaped step list. */}
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant="h5" component="h2">
+            Conditions
+          </Typography>
+          <Button
+            variant="outlined"
+            startIcon={<AddIcon />}
+            onClick={handleAddCondition}
+          >
+            Add Condition
+          </Button>
+        </Box>
+
+        <List component={Paper} sx={{ mb: 4 }}>
+          {experiment.conditions.map((condition, index) => {
+            const palette = getPaletteColor(condition.color);
+            const stepCount = experiment.steps.filter(
+              (s) => s.condition_id === condition.id
+            ).length;
+            return (
+              <React.Fragment key={condition.id}>
+                {index > 0 && <Divider />}
+                <ListItem
+                  secondaryAction={
+                    <Box>
+                      <IconButton
+                        edge="end"
+                        aria-label="move condition up"
+                        disabled={index === 0}
+                        onClick={() => handleMoveCondition(index, 'up')}
+                      >
+                        <ArrowUpwardIcon />
+                      </IconButton>
+                      <IconButton
+                        edge="end"
+                        aria-label="move condition down"
+                        disabled={index === experiment.conditions.length - 1}
+                        onClick={() => handleMoveCondition(index, 'down')}
+                      >
+                        <ArrowDownwardIcon />
+                      </IconButton>
+                      <IconButton
+                        edge="end"
+                        aria-label="edit condition"
+                        onClick={() => handleEditCondition(index)}
+                      >
+                        <EditIcon />
+                      </IconButton>
+                      <IconButton
+                        edge="end"
+                        aria-label="delete condition"
+                        onClick={() => handleDeleteCondition(index)}
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </Box>
+                  }
+                >
+                  <Chip
+                    label={condition.name || '(unnamed)'}
+                    sx={{
+                      bgcolor: palette.bg,
+                      color: palette.fg,
+                      fontWeight: 600,
+                      mr: 2,
+                    }}
+                  />
+                  <ListItemText
+                    primary={`${stepCount} step${stepCount === 1 ? '' : 's'}`}
+                    secondary={condition.description || undefined}
+                  />
+                </ListItem>
+              </React.Fragment>
+            );
+          })}
+        </List>
+
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
           <Typography variant="h5" component="h2">
             Experiment Steps
           </Typography>
-          <Button 
-            variant="contained" 
+          <Button
+            variant="contained"
             startIcon={<AddIcon />}
             onClick={handleAddStep}
+            disabled={experiment.conditions.length === 0}
           >
             Add Step
           </Button>
         </Box>
-        
+
         {experiment.steps.length === 0 ? (
           <Paper sx={{ p: 3, textAlign: 'center' }}>
             <Typography color="text.secondary">
@@ -374,70 +708,128 @@ const ExperimentDesigner: React.FC = () => {
             </Typography>
           </Paper>
         ) : (
-          <List component={Paper}>
-            {experiment.steps.map((step, index) => (
-              <React.Fragment key={step.id}>
-                {index > 0 && <Divider />}
-                <ListItem
-                  secondaryAction={
-                    <Box>
-                      <IconButton 
-                        edge="end" 
-                        aria-label="move up"
-                        disabled={index === 0}
-                        onClick={() => handleMoveStep(index, 'up')}
-                      >
-                        <ArrowUpwardIcon />
-                      </IconButton>
-                      <IconButton 
-                        edge="end" 
-                        aria-label="move down"
-                        disabled={index === experiment.steps.length - 1}
-                        onClick={() => handleMoveStep(index, 'down')}
-                      >
-                        <ArrowDownwardIcon />
-                      </IconButton>
-                      <IconButton 
-                        edge="end" 
-                        aria-label="edit"
-                        onClick={() => handleEditStep(index)}
-                      >
-                        <EditIcon />
-                      </IconButton>
-                      <IconButton 
-                        edge="end" 
-                        aria-label="delete"
-                        onClick={() => handleDeleteStep(index)}
-                      >
-                        <DeleteIcon />
-                      </IconButton>
+          <Stack spacing={3}>
+            {stepsByCondition.map(({ condition, entries }) => {
+              const palette = getPaletteColor(condition.color);
+              return (
+                <Paper key={condition.id} sx={{ overflow: 'hidden' }}>
+                  <Box
+                    sx={{
+                      bgcolor: palette.bg,
+                      color: palette.fg,
+                      px: 2,
+                      py: 1,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 1,
+                    }}
+                  >
+                    <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                      {condition.name || '(unnamed)'}
+                    </Typography>
+                    <Typography variant="caption" sx={{ opacity: 0.85 }}>
+                      ({entries.length} step{entries.length === 1 ? '' : 's'})
+                    </Typography>
+                  </Box>
+                  {entries.length === 0 ? (
+                    <Box sx={{ p: 2 }}>
+                      <Typography variant="body2" color="text.secondary">
+                        No steps in this condition yet.
+                      </Typography>
                     </Box>
-                  }
-                >
-                  <ListItemText
-                    primary={step.name}
-                    secondary={
-                      <>
-                        <Typography component="span" variant="body2" color="text.primary">
-                          Type: {step.step_type} | Duration: {step.duration_minutes} min
-                        </Typography>
-                        {step.dependencies.length > 0 && (
-                          <Typography component="span" variant="body2" display="block">
-                            Dependencies: {step.dependencies.map(depId => {
-                              const depStep = experiment.steps.find(s => s.id === depId);
-                              return depStep ? depStep.name : depId;
-                            }).join(', ')}
-                          </Typography>
-                        )}
-                      </>
-                    }
-                  />
-                </ListItem>
-              </React.Fragment>
-            ))}
-          </List>
+                  ) : (
+                    <List disablePadding>
+                      {entries.map(({ step, originalIndex }, localIndex) => (
+                        <React.Fragment key={step.id}>
+                          {localIndex > 0 && <Divider />}
+                          <ListItem
+                            secondaryAction={
+                              <Box>
+                                <IconButton
+                                  edge="end"
+                                  aria-label="move up"
+                                  disabled={originalIndex === 0}
+                                  onClick={() => handleMoveStep(originalIndex, 'up')}
+                                >
+                                  <ArrowUpwardIcon />
+                                </IconButton>
+                                <IconButton
+                                  edge="end"
+                                  aria-label="move down"
+                                  disabled={originalIndex === experiment.steps.length - 1}
+                                  onClick={() => handleMoveStep(originalIndex, 'down')}
+                                >
+                                  <ArrowDownwardIcon />
+                                </IconButton>
+                                <IconButton
+                                  edge="end"
+                                  aria-label="edit"
+                                  onClick={() => handleEditStep(originalIndex)}
+                                >
+                                  <EditIcon />
+                                </IconButton>
+                                <IconButton
+                                  edge="end"
+                                  aria-label="delete"
+                                  onClick={() => handleDeleteStep(originalIndex)}
+                                >
+                                  <DeleteIcon />
+                                </IconButton>
+                              </Box>
+                            }
+                          >
+                            <ListItemText
+                              primary={step.name}
+                              secondary={
+                                <>
+                                  <Typography component="span" variant="body2" color="text.primary">
+                                    Type: {step.step_type} | Duration: {step.duration_minutes} min
+                                  </Typography>
+                                  {step.dependencies.length > 0 && (
+                                    <Typography component="span" variant="body2" display="block">
+                                      Dependencies: {step.dependencies.map((depId) => {
+                                        const depStep = experiment.steps.find((s) => s.id === depId);
+                                        return depStep ? depStep.name : depId;
+                                      }).join(', ')}
+                                    </Typography>
+                                  )}
+                                </>
+                              }
+                            />
+                          </ListItem>
+                        </React.Fragment>
+                      ))}
+                    </List>
+                  )}
+                </Paper>
+              );
+            })}
+            {orphanSteps.length > 0 && (
+              <Paper sx={{ overflow: 'hidden' }}>
+                <Box sx={{ bgcolor: 'error.main', color: 'error.contrastText', px: 2, py: 1 }}>
+                  <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                    Orphan steps (no Condition)
+                  </Typography>
+                </Box>
+                <List disablePadding>
+                  {orphanSteps.map(({ step, originalIndex }) => (
+                    <ListItem
+                      key={step.id}
+                      secondaryAction={
+                        <IconButton aria-label="edit" onClick={() => handleEditStep(originalIndex)}>
+                          <EditIcon />
+                        </IconButton>
+                      }
+                    >
+                      <ListItemText primary={step.name} secondary="Reassign this step to a Condition." />
+                    </ListItem>
+                  ))}
+                </List>
+              </Paper>
+            )}
+          </Stack>
         )}
-        
+
         <Box sx={{ mt: 4, display: 'flex', justifyContent: 'flex-end' }}>
           <Button
             variant="contained"
@@ -450,10 +842,10 @@ const ExperimentDesigner: React.FC = () => {
           </Button>
         </Box>
       </Box>
-      
+
       {/* Step Dialog */}
-      <Dialog 
-        open={openStepDialog} 
+      <Dialog
+        open={openStepDialog}
         onClose={() => setOpenStepDialog(false)}
         fullWidth
         maxWidth="sm"
@@ -468,10 +860,33 @@ const ExperimentDesigner: React.FC = () => {
                 fullWidth
                 label="Step Name"
                 value={currentStep?.name || ''}
-                onChange={(e) => currentStep && setCurrentStep({...currentStep, name: e.target.value})}
+                onChange={(e) =>
+                  currentStep && setCurrentStep({ ...currentStep, name: e.target.value })
+                }
                 variant="outlined"
                 required
               />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <FormControl fullWidth>
+                <InputLabel id="step-condition-label">Condition</InputLabel>
+                <Select
+                  labelId="step-condition-label"
+                  value={currentStep?.condition_id || ''}
+                  label="Condition"
+                  onChange={handleStepConditionChange}
+                >
+                  {experiment.conditions.map((c) => (
+                    <MenuItem key={c.id} value={c.id}>
+                      {c.name || '(unnamed)'}
+                    </MenuItem>
+                  ))}
+                </Select>
+                <FormHelperText>
+                  Cross-condition dependencies are not allowed; moving a step to another
+                  condition will strip its existing dependencies.
+                </FormHelperText>
+              </FormControl>
             </Grid>
             <Grid item xs={12} sm={6}>
               <FormControl fullWidth>
@@ -515,31 +930,47 @@ const ExperimentDesigner: React.FC = () => {
                   multiple
                   value={currentStep?.dependencies || []}
                   label="Dependencies"
-                  onChange={(e) => currentStep && setCurrentStep({
-                    ...currentStep, 
-                    dependencies: typeof e.target.value === 'string' 
-                      ? e.target.value.split(',') 
-                      : e.target.value
-                  })}
+                  onChange={(e) =>
+                    currentStep &&
+                    setCurrentStep({
+                      ...currentStep,
+                      dependencies:
+                        typeof e.target.value === 'string'
+                          ? e.target.value.split(',')
+                          : e.target.value,
+                    })
+                  }
                   renderValue={(selected) => {
                     if (Array.isArray(selected)) {
-                      return selected.map(depId => {
-                        const depStep = experiment.steps.find(s => s.id === depId);
-                        return depStep ? depStep.name : depId;
-                      }).join(', ');
+                      return selected
+                        .map((depId) => {
+                          const depStep = experiment.steps.find((s) => s.id === depId);
+                          return depStep ? depStep.name : depId;
+                        })
+                        .join(', ');
                     }
                     return '';
                   }}
                 >
                   {experiment.steps
-                    .filter(step => !currentStep || step.id !== currentStep.id)
+                    // Only steps in the SAME Condition can be dependencies (U1 contract).
+                    // The backend rejects cross-condition deps, so don't even show them
+                    // as choices in the dropdown.
+                    .filter(
+                      (step) =>
+                        (!currentStep || step.id !== currentStep.id) &&
+                        currentStep &&
+                        step.condition_id === currentStep.condition_id
+                    )
                     .map((step) => (
                       <MenuItem key={step.id} value={step.id}>
                         {step.name}
                       </MenuItem>
                     ))}
                 </Select>
-                <FormHelperText>Steps that must complete before this step can start</FormHelperText>
+                <FormHelperText>
+                  Steps in the same Condition that must complete before this step can start
+                </FormHelperText>
               </FormControl>
             </Grid>
             <Grid item xs={12}>
@@ -547,7 +978,9 @@ const ExperimentDesigner: React.FC = () => {
                 fullWidth
                 label="Resource Needed"
                 value={currentStep?.resource_required || ''}
-                onChange={(e) => currentStep && setCurrentStep({...currentStep, resource_required: e.target.value})}
+                onChange={(e) =>
+                  currentStep && setCurrentStep({ ...currentStep, resource_required: e.target.value })
+                }
                 variant="outlined"
                 placeholder="e.g., microscope, user_attention, lab_bench"
               />
@@ -557,7 +990,9 @@ const ExperimentDesigner: React.FC = () => {
                 fullWidth
                 label="Notes"
                 value={currentStep?.notes || ''}
-                onChange={(e) => currentStep && setCurrentStep({...currentStep, notes: e.target.value})}
+                onChange={(e) =>
+                  currentStep && setCurrentStep({ ...currentStep, notes: e.target.value })
+                }
                 variant="outlined"
                 multiline
                 rows={3}
@@ -567,7 +1002,7 @@ const ExperimentDesigner: React.FC = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenStepDialog(false)}>Cancel</Button>
-          <Button 
+          <Button
             onClick={handleSaveStep}
             disabled={!currentStep?.name}
             variant="contained"
@@ -576,8 +1011,42 @@ const ExperimentDesigner: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Condition editor dialog */}
+      {conditionDraft && (
+        <ConditionEditor
+          condition={conditionDraft}
+          open={openConditionDialog}
+          onSave={handleSaveCondition}
+          onCancel={() => {
+            setOpenConditionDialog(false);
+            setConditionDraft(null);
+            setEditingConditionIndex(-1);
+          }}
+          title={editingConditionIndex >= 0 ? 'Edit Condition' : 'Add Condition'}
+        />
+      )}
+
+      {/* Cross-condition move confirmation dialog */}
+      <Dialog open={Boolean(conditionMoveConfirm)} onClose={handleCancelConditionMove}>
+        <DialogTitle>Move step to a different Condition?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Moving this step to a new Condition will remove its{' '}
+            {conditionMoveConfirm?.dependencyCount ?? 0} dependency
+            {conditionMoveConfirm?.dependencyCount === 1 ? '' : 'ies'}. Cross-condition
+            dependencies are not allowed. Continue?
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCancelConditionMove}>Cancel</Button>
+          <Button onClick={handleConfirmConditionMove} variant="contained" color="warning">
+            Move and strip dependencies
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 };
 
-export default ExperimentDesigner; 
+export default ExperimentDesigner;
