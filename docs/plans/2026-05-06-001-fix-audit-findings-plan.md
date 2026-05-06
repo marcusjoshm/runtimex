@@ -1,7 +1,7 @@
 ---
 title: "fix: Address audit findings — bootability, persistence, auth, conflict detection"
 type: fix
-status: active
+status: completed
 date: 2026-05-06
 ---
 
