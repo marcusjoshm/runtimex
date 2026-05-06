@@ -34,6 +34,11 @@ from models import (
 )
 from scheduler import Scheduler
 import auth
+from permissions import (
+    can_view_experiment,
+    can_edit_experiment,
+    can_run_step,
+)
 
 # Import notification system
 from notifications import NotificationService, Notification, NotificationType, NotificationPriority, ActionType, NotificationAction, create_notification_factories
@@ -144,18 +149,40 @@ def experiment_to_dict(experiment):
 # --- API Routes ---
 
 @app.route('/api/experiments', methods=['GET'])
+@jwt_required()
 def get_experiments():
-    # Return all experiments
-    experiments = [experiment_to_dict(exp) for exp in scheduler.experiments.values()]
+    """List experiments visible to the requesting user (own + shared).
+
+    Behavior change vs. pre-U3: this endpoint used to return *all* experiments
+    in the system. It now scopes to the current user's view set. The Home
+    page already uses `/api/user/experiments` for "my" experiments, so the
+    semantic change is consistent with how the frontend consumes this route.
+    """
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+    experiments = [
+        experiment_to_dict(exp)
+        for exp in scheduler.experiments.values()
+        if can_view_experiment(user, exp)
+    ]
     return jsonify(experiments)
 
 @app.route('/api/experiments/<experiment_id>', methods=['GET'])
+@jwt_required()
 def get_experiment(experiment_id):
-    # Return a specific experiment
+    """Fetch a single experiment.
+
+    Existence-privacy: if the user lacks view permission we return 404, not
+    403. That keeps an attacker from probing experiment IDs to confirm they
+    exist.
+    """
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
     experiment = scheduler.experiments.get(experiment_id)
-    if not experiment:
+    if not experiment or not can_view_experiment(user, experiment):
         return jsonify({'error': 'Experiment not found'}), 404
-    
+
     return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/experiments', methods=['POST'])
@@ -195,6 +222,7 @@ def create_experiment():
     return jsonify(experiment_to_dict(experiment)), 201
 
 @app.route('/api/experiments/<experiment_id>', methods=['PUT'])
+@jwt_required()
 def update_experiment(experiment_id):
     """Update an experiment, preserving in-flight step state.
 
@@ -202,10 +230,18 @@ def update_experiment(experiment_id):
     step status + actual_start_time on every save). Steps are upserted by
     ID: surviving IDs keep their runtime state; missing IDs are removed;
     new IDs are added.
+
+    Permission policy (U3): users without view perms get 404 (existence
+    privacy); users with view-only get 403 with "edit permission required".
     """
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
     experiment = scheduler.experiments.get(experiment_id)
-    if not experiment:
+    if not experiment or not can_view_experiment(user, experiment):
         return jsonify({'error': 'Experiment not found'}), 404
+    if not can_edit_experiment(user, experiment):
+        return jsonify({'error': 'edit permission required'}), 403
 
     data = request.json or {}
 
@@ -248,68 +284,66 @@ def update_experiment(experiment_id):
 
     return jsonify(experiment_to_dict(experiment))
 
-@app.route('/api/steps/<step_id>/start', methods=['POST'])
-def start_step(step_id):
-    # Start a step
-    step = scheduler.get_step(step_id)
-    if not step:
-        return jsonify({'error': 'Step not found'}), 404
-    
-    scheduler.handle_step_start(step_id)
-    experiment = None
-    
-    # Find the experiment this step belongs to
+def _find_experiment_for_step(step_id):
+    """Locate the experiment that owns a step. Helper for step-state routes."""
     for exp in scheduler.experiments.values():
         if step_id in exp.steps:
-            experiment = exp
-            break
-    
-    if experiment:
-        return jsonify(experiment_to_dict(experiment))
-    else:
-        return jsonify({'error': 'Experiment not found for step'}), 500
+            return exp
+    return None
+
+
+def _authorize_step_transition(step_id):
+    """Resolve (step, experiment, error_response) for a step-state mutation.
+
+    Returns ``(step, experiment, None)`` on success or
+    ``(None, None, (json, status))`` on auth/permission/not-found failure.
+
+    Existence-privacy: if the user can't view the parent experiment, we
+    pretend the step doesn't exist (404), regardless of whether it actually
+    does. View-but-not-edit returns 403 with the documented error shape.
+    """
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
+    step = scheduler.get_step(step_id)
+    experiment = _find_experiment_for_step(step_id) if step else None
+
+    if not step or not experiment or not can_view_experiment(user, experiment):
+        return None, None, (jsonify({'error': 'Step not found'}), 404)
+    if not can_run_step(user, step, experiment):
+        return None, None, (jsonify({'error': 'edit permission required'}), 403)
+    return step, experiment, None
+
+
+@app.route('/api/steps/<step_id>/start', methods=['POST'])
+@jwt_required()
+def start_step(step_id):
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
+    scheduler.handle_step_start(step_id)
+    return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/steps/<step_id>/pause', methods=['POST'])
+@jwt_required()
 def pause_step(step_id):
-    # Pause a step
-    step = scheduler.get_step(step_id)
-    if not step:
-        return jsonify({'error': 'Step not found'}), 404
-    
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
     scheduler.handle_step_pause(step_id)
-    
-    # Find the experiment this step belongs to
-    experiment = None
-    for exp in scheduler.experiments.values():
-        if step_id in exp.steps:
-            experiment = exp
-            break
-    
-    if experiment:
-        return jsonify(experiment_to_dict(experiment))
-    else:
-        return jsonify({'error': 'Experiment not found for step'}), 500
+    return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/steps/<step_id>/complete', methods=['POST'])
+@jwt_required()
 def complete_step(step_id):
-    # Complete a step
-    step = scheduler.get_step(step_id)
-    if not step:
-        return jsonify({'error': 'Step not found'}), 404
-    
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
     scheduler.handle_step_complete(step_id)
-    
-    # Find the experiment this step belongs to
-    experiment = None
-    for exp in scheduler.experiments.values():
-        if step_id in exp.steps:
-            experiment = exp
-            break
-    
-    if experiment:
-        return jsonify(experiment_to_dict(experiment))
-    else:
-        return jsonify({'error': 'Experiment not found for step'}), 500
+    return jsonify(experiment_to_dict(experiment))
 
 # Add a route to get user's experiments
 @app.route('/api/user/experiments', methods=['GET'])
@@ -390,14 +424,22 @@ def share_experiment(experiment_id):
     return jsonify({"message": f"Experiment shared with {share_with_username}"}), 200
 
 # Add export experiment endpoint
+#
+# Behavior change (U3): export now requires a valid JWT and view-permission on
+# the experiment. The previous `optional=True` allowed unauthenticated export
+# of any experiment by ID -- that's an existence-leak + data-leak vector.
+# Public-share semantics are deferred to a follow-up plan; until then export
+# behaves like every other read endpoint.
 @app.route('/api/experiments/<experiment_id>/export', methods=['GET'])
-@jwt_required(optional=True)  # Make auth optional so non-logged-in users can still export
+@jwt_required()
 def export_experiment(experiment_id):
-    # Get experiment
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
     experiment = scheduler.experiments.get(experiment_id)
-    if not experiment:
+    if not experiment or not can_view_experiment(user, experiment):
         return jsonify({"error": "Experiment not found"}), 404
-    
+
     # Convert to exportable format (strip user-specific data)
     export_data = experiment_to_dict(experiment)
     
@@ -597,6 +639,29 @@ def create_from_template(template_id):
         scheduler.calculate_initial_schedule(start_time=start_time)
 
     return jsonify(experiment_to_dict(experiment)), 201
+
+# Username search for the share dialog. Prefix-match by username,
+# case-insensitive, capped at 25 results. Emails are intentionally NOT
+# returned -- that's a privacy default; a follow-up could expose emails for
+# users who already have a share/contact relationship with the requester.
+@app.route('/api/users/search', methods=['GET'])
+@jwt_required()
+def search_users():
+    q = request.args.get('q', '')
+    if not q:
+        return jsonify({"error": "q parameter required"}), 400
+
+    # Case-insensitive prefix match. SQLite's LIKE is already case-insensitive
+    # for ASCII; ilike makes that explicit and portable.
+    rows = (
+        UserORM.query
+        .filter(UserORM.username.ilike(f"{q}%"))
+        .order_by(UserORM.username)
+        .limit(25)
+        .all()
+    )
+    return jsonify([{"username": r.username} for r in rows])
+
 
 # Add notification routes
 @app.route('/api/notifications', methods=['GET'])

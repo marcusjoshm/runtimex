@@ -61,3 +61,30 @@ def auth_headers(client):
     assert response.status_code == 201, response.get_json()
     token = response.get_json()["token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+def register_user(client, username: str, email: str = None, password: str = "secret123"):
+    """Helper: register a user and return Authorization headers.
+
+    Used by permission tests that need a second (or third) account distinct
+    from the default ``auth_headers`` Alice. Idempotent for re-registration
+    (returns 201 on first call only).
+    """
+    email = email or f"{username}@example.com"
+    response = client.post(
+        "/api/auth/register",
+        json={"username": username, "email": email, "password": password},
+    )
+    assert response.status_code == 201, response.get_json()
+    token = response.get_json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def second_user_headers(client):
+    """Register a second user (``bob``) and return Authorization headers.
+
+    Use alongside ``auth_headers`` for share/permission tests where two
+    distinct users need to act on the same experiment.
+    """
+    return register_user(client, "bob", "bob@example.com", "secret456")
