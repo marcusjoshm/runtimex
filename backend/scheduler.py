@@ -285,10 +285,90 @@ class Scheduler:
                      )
                      print(f"Step '{step.name}' is now READY.")
 
-    def check_for_conflicts(self) -> List[Tuple[Step, Step]]:
-        """Identifies steps that overlap in time and might require user intervention."""
-        # Real implementation lands in U6.
-        return []
+    @staticmethod
+    def check_for_conflicts(experiment: Experiment) -> List[Dict[str, object]]:
+        """Detect resource-overlap conflicts within a single experiment.
+
+        Pure function: no DB writes, no side effects. The scheduler is
+        ``self``-less here on purpose so a route handler can call it on any
+        ``Experiment`` instance (e.g. one freshly hydrated from the DB) without
+        worrying about cache state.
+
+        Algorithm:
+
+        1. Collect ``(step_id, step_name, resource, start, end)`` tuples for
+           every step where ``resource_needed`` is non-empty AND both
+           scheduled times are present.
+        2. Group by resource, sort each group by ``start``.
+        3. Walk pairwise within a group; emit a conflict for each pair whose
+           half-open intervals overlap (``a.start < b.end and b.start < a.end``).
+
+        Multi-experiment cross-checking is **out of scope** here -- the v1
+        contract per the plan is "within a single experiment only". A future
+        unit can add a workspace-wide pass on top.
+
+        Returns:
+            A list of dicts, one per overlapping pair:
+            ``{step_a, step_b, resource, overlap_seconds, step_a_name, step_b_name}``.
+            ``overlap_seconds`` is an integer (rounded down) so the wire shape
+            stays small. The names are included so the frontend can render
+            without re-resolving step IDs.
+        """
+        # 1. Collect candidates. Skip anything missing a resource or a
+        #    scheduled window -- those can't participate in a real conflict.
+        candidates: List[Tuple[str, str, str, datetime, datetime]] = []
+        for step in experiment.steps.values():
+            resource = step.resource_needed
+            if not resource:  # None or empty string
+                continue
+            start = step.scheduled_start_time
+            end = step.scheduled_end_time
+            if start is None or end is None:
+                continue
+            candidates.append((step.id, step.name, resource, start, end))
+
+        if not candidates:
+            return []
+
+        # 2. Group by resource.
+        by_resource: Dict[str, List[Tuple[str, str, str, datetime, datetime]]] = {}
+        for entry in candidates:
+            by_resource.setdefault(entry[2], []).append(entry)
+
+        conflicts: List[Dict[str, object]] = []
+
+        # 3. Pairwise overlap check within each group.
+        for resource, entries in by_resource.items():
+            entries.sort(key=lambda e: e[3])  # sort by start
+            n = len(entries)
+            for i in range(n):
+                a_id, a_name, _, a_start, a_end = entries[i]
+                for j in range(i + 1, n):
+                    b_id, b_name, _, b_start, b_end = entries[j]
+                    # Sorted by start, so a_start <= b_start. Once b_start
+                    # is at or past a_end there's no further overlap with i.
+                    if b_start >= a_end:
+                        break
+                    # Half-open intervals: equality on the boundary is NOT a
+                    # conflict (one ends exactly when the other begins).
+                    if a_start < b_end and b_start < a_end:
+                        overlap_start = max(a_start, b_start)
+                        overlap_end = min(a_end, b_end)
+                        overlap_seconds = int((overlap_end - overlap_start).total_seconds())
+                        # Zero-duration windows can't generate a real overlap;
+                        # the half-open check above already filters those, but
+                        # be defensive here against negative skew from clock math.
+                        if overlap_seconds <= 0:
+                            continue
+                        conflicts.append({
+                            "step_a": a_id,
+                            "step_b": b_id,
+                            "resource": resource,
+                            "overlap_seconds": overlap_seconds,
+                            "step_a_name": a_name,
+                            "step_b_name": b_name,
+                        })
+        return conflicts
 
     def handle_step_start(self, step_id: str, start_time: Optional[datetime] = None):
         """Handles the logic when a step starts."""

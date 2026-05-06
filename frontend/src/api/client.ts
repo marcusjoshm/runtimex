@@ -28,6 +28,28 @@ export interface Experiment {
   sharedWith?: Record<string, string>; // username -> permission
 }
 
+// Resource-conflict descriptor. Returned by GET /api/experiments/<id>/conflicts
+// and surfaced inline in the PUT response (`{ ...experiment, conflicts: [...] }`)
+// so the Designer can warn on save without an extra round-trip.
+//
+// NOTE for U8 (snake_case rename pass): the wire shape is already snake_case
+// here (the backend emits `step_a`, `overlap_seconds`, etc.), so this
+// interface is pre-aligned -- when U8 normalizes the rest of the surface to
+// snake_case, this one will need no changes.
+export interface Conflict {
+  step_a: string;
+  step_b: string;
+  resource: string;
+  overlap_seconds: number;
+  step_a_name: string;
+  step_b_name: string;
+}
+
+// Response shape for createExperiment / updateExperiment. The PUT path
+// includes `conflicts`; the POST path doesn't (yet) but typing it as
+// optional means the Designer can read it uniformly.
+export type ExperimentSaveResponse = Experiment & { conflicts?: Conflict[] };
+
 // Create API client
 const apiClient = {
   // Experiment API methods
@@ -46,8 +68,24 @@ const apiClient = {
     return response.data;
   },
   
-  updateExperiment: async (id: string, experiment: Partial<Experiment>): Promise<Experiment> => {
+  updateExperiment: async (
+    id: string,
+    experiment: Partial<Experiment>
+  ): Promise<ExperimentSaveResponse> => {
+    // Backend returns the full experiment payload + a `conflicts: Conflict[]`
+    // field (U6). Callers that don't care about conflicts can ignore it; the
+    // Designer reads it on save to surface a warning Alert.
     const response = await axios.put(`${API_URL}/experiments/${id}`, experiment);
+    return response.data;
+  },
+
+  // Fetch the current conflict list for an experiment. Mirrors the server's
+  // pure `Scheduler.check_for_conflicts` -- so the Runner can re-fetch on
+  // every `experiment_update` socket push without worrying about staleness.
+  getConflicts: async (experimentId: string): Promise<Conflict[]> => {
+    const response = await axios.get(
+      `${API_URL}/experiments/${experimentId}/conflicts`
+    );
     return response.data;
   },
   

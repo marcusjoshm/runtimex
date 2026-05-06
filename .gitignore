@@ -47,7 +47,9 @@ node_modules/
 *.swo
 .DS_Store venv/
 
-# SQLite databases (dev/test)
+# SQLite databases (dev/test). Flask-SQLAlchemy 3.x writes relative SQLite
+# URIs into backend/instance/ by default, so ignore the whole folder.
 runtimex.db
 runtimex-smoke.db
 *.db-journal
+backend/instance/

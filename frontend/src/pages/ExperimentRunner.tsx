@@ -15,7 +15,6 @@ import {
   Dialog,
   DialogTitle,
   DialogContent,
-  DialogContentText,
   DialogActions,
   List,
   ListItem,
@@ -32,7 +31,7 @@ import SkipNextIcon from '@mui/icons-material/SkipNext';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ErrorIcon from '@mui/icons-material/Error';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
-import apiClient, { Experiment, Step } from '../api/client';
+import apiClient, { Experiment, Step, Conflict } from '../api/client';
 import socketService from '../api/socket';
 
 // Maps to match backend enum values
@@ -62,8 +61,12 @@ const ExperimentRunner: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
-  const [showConflictDialog, setShowConflictDialog] = useState(false);
-  const [conflicts, setConflicts] = useState<{ step1: Step, step2: Step }[]>([]);
+  // Conflicts come from the backend's `Scheduler.check_for_conflicts` (U6).
+  // We refresh on mount and after every `experiment_update` socket push so
+  // the warning Alert stays in sync with the current schedule. The previous
+  // client-side check inside `handleStepStart` is removed -- it duplicated
+  // server logic and produced a double-dialog when both fired.
+  const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
 
@@ -91,27 +94,45 @@ const ExperimentRunner: React.FC = () => {
   // Subscribe to experiment updates
   useEffect(() => {
     if (!experimentId) return;
-    
+
     // Start receiving updates for this experiment
     socketService.startExperimentUpdates(experimentId);
-    
+
     // Register handler for experiment updates
     const unsubscribe = socketService.onExperimentUpdate((updatedExperiment) => {
       // Only update if it's the current experiment
       if (updatedExperiment.id === experimentId) {
         setExperiment(updatedExperiment);
-        
+
         // Update active step index if needed
         const readyStepIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
         if (readyStepIndex !== -1 && activeStepIndex === null) {
           setActiveStepIndex(readyStepIndex);
         }
+
+        // Re-fetch conflicts. A step state transition can change which steps
+        // are READY/RUNNING -- a future U7 may emit notifications based on
+        // the same list, so keep this Alert source-of-truth aligned with the
+        // server's view. Errors here are non-fatal: silently fall back to
+        // showing whatever conflicts we last fetched.
+        apiClient.getConflicts(experimentId)
+          .then(setConflicts)
+          .catch((err) => console.error('Failed to refresh conflicts:', err));
       }
     });
-    
+
     // Clean up subscription
     return unsubscribe;
   }, [experimentId, activeStepIndex]);
+
+  // Initial conflict fetch on mount. The socket handler above keeps it
+  // refreshed, but the first paint also needs them.
+  useEffect(() => {
+    if (!experimentId) return;
+    apiClient.getConflicts(experimentId)
+      .then(setConflicts)
+      .catch((err) => console.error('Failed to fetch conflicts:', err));
+  }, [experimentId]);
 
   // Fetch experiment data
   useEffect(() => {
@@ -276,33 +297,21 @@ const ExperimentRunner: React.FC = () => {
   // Handle step actions
   const handleStepStart = async (stepId: string) => {
     if (!experiment) return;
-    
+
+    // U6: conflict detection now lives on the server. The client-side
+    // pairwise check that used to live here was removed -- it duplicated
+    // the backend's `Scheduler.check_for_conflicts` (run once per
+    // `experiment_update`), and when both fired the user saw a redundant
+    // dialog. Conflicts are surfaced via the warning Alert above the step
+    // grid; nothing to do here except start the step.
     try {
       const updatedExperiment = await apiClient.startStep(stepId);
       setExperiment(updatedExperiment);
-      
+
       // Set this step as active
       const newActiveIndex = updatedExperiment.steps.findIndex(step => step.id === stepId);
       if (newActiveIndex !== -1) {
         setActiveStepIndex(newActiveIndex);
-      }
-      
-      // Check for conflicts (steps running at the same time that use the same resource)
-      const runningSteps = updatedExperiment.steps.filter(step => step.status === StepStatus.RUNNING);
-      const newConflicts = [];
-      
-      for (let i = 0; i < runningSteps.length; i++) {
-        for (let j = i + 1; j < runningSteps.length; j++) {
-          if (runningSteps[i].resourceNeeded && 
-              runningSteps[i].resourceNeeded === runningSteps[j].resourceNeeded) {
-            newConflicts.push({ step1: runningSteps[i], step2: runningSteps[j] });
-          }
-        }
-      }
-      
-      if (newConflicts.length > 0) {
-        setConflicts(newConflicts);
-        setShowConflictDialog(true);
       }
     } catch (err) {
       console.error('Failed to start step:', err);
@@ -632,6 +641,23 @@ const ExperimentRunner: React.FC = () => {
           </Box>
         )}
         
+        {/* Resource conflict warnings (U6). Non-blocking on purpose: the
+            previous dialog interrupted the user's flow on every Start click.
+            The server's check_for_conflicts powers this list, so it stays
+            consistent with whatever U7 will use to fire notifications. */}
+        {conflicts.length > 0 && (
+          <Alert severity="warning" sx={{ mb: 3 }}>
+            <Typography variant="subtitle2" gutterBottom>
+              Resource conflicts detected ({conflicts.length}):
+            </Typography>
+            {conflicts.map((c) => (
+              <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
+                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+              </Typography>
+            ))}
+          </Alert>
+        )}
+
         {/* Steps List */}
         <Box sx={{ mb: 4 }}>
           <Typography variant="h5" gutterBottom>
@@ -665,37 +691,6 @@ const ExperimentRunner: React.FC = () => {
           </List>
         </Box>
       </Box>
-      
-      {/* Conflict Dialog */}
-      <Dialog
-        open={showConflictDialog}
-        onClose={() => setShowConflictDialog(false)}
-      >
-        <DialogTitle>Resource Conflict Detected</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            The following steps are trying to use the same resources at the same time:
-          </DialogContentText>
-          <List>
-            {conflicts.map((conflict, index) => (
-              <ListItem key={index}>
-                <ListItemText
-                  primary={`Conflict: ${conflict.step1.name} and ${conflict.step2.name}`}
-                  secondary={`Both need ${conflict.step1.resourceNeeded}`}
-                />
-              </ListItem>
-            ))}
-          </List>
-          <DialogContentText>
-            Consider pausing one of the steps or rescheduling.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setShowConflictDialog(false)}>
-            Acknowledge
-          </Button>
-        </DialogActions>
-      </Dialog>
       
       {/* Step Info Dialog */}
       <Dialog

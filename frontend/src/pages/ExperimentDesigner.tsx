@@ -32,7 +32,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import SaveIcon from '@mui/icons-material/Save';
-import apiClient, { Experiment as ApiExperiment, Step as ApiStep } from '../api/client';
+import apiClient, { Experiment as ApiExperiment, Step as ApiStep, Conflict } from '../api/client';
 
 interface Step {
   id: string;
@@ -73,6 +73,16 @@ const ExperimentDesigner: React.FC = () => {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
+  // Conflicts returned by the backend on save (U6). When non-empty, we
+  // intentionally suppress the navigate('/') so the user sees the warning
+  // and can decide whether to fix the schedule before leaving the page.
+  // Design choice: suppress-navigate is the simplest of the two options
+  // sketched in the plan -- a transient localStorage handoff to Home would
+  // need a corresponding read site, and a snackbar-then-navigate fights
+  // against the user's eyes (a snackbar that disappears before they read it
+  // is worse than no snackbar). Forcing them to dismiss the alert by
+  // clicking "Back to home" gives them an unmissable signal.
+  const [conflicts, setConflicts] = useState<Conflict[]>([]);
 
   // Load experiment data if editing an existing one
   useEffect(() => {
@@ -223,12 +233,32 @@ const ExperimentDesigner: React.FC = () => {
 
     try {
       setSaving(true);
+      // Only the PUT path returns a `conflicts` array today (U6). New
+      // experiments don't surface them on POST -- the backend lays out the
+      // schedule from "now" and any overlaps are reported on the next save
+      // or via GET /api/experiments/<id>/conflicts. If U7 wires conflicts
+      // into the POST response too, this branch becomes uniform.
+      let saveResultConflicts: Conflict[] = [];
       if (experimentId) {
-        await apiClient.updateExperiment(experimentId, payload as Partial<ApiExperiment>);
+        const updated = await apiClient.updateExperiment(
+          experimentId,
+          payload as Partial<ApiExperiment>
+        );
+        saveResultConflicts = updated.conflicts ?? [];
       } else {
         await apiClient.createExperiment(payload as Omit<ApiExperiment, 'id'>);
       }
-      navigate('/');
+
+      if (saveResultConflicts.length > 0) {
+        // Show the warning in place; do NOT navigate. The user sees the
+        // alert and can either ignore it (navigate back via the Back button)
+        // or fix the schedule and save again.
+        setConflicts(saveResultConflicts);
+      } else {
+        // Clean save: behave as before.
+        setConflicts([]);
+        navigate('/');
+      }
     } catch (err: any) {
       setSaveError(err.response?.data?.error || 'Save failed');
     } finally {
@@ -269,6 +299,19 @@ const ExperimentDesigner: React.FC = () => {
         {saveError && (
           <Alert severity="error" sx={{ mb: 2 }}>
             {saveError}
+          </Alert>
+        )}
+
+        {conflicts.length > 0 && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            <Typography variant="subtitle2" gutterBottom>
+              Saved with {conflicts.length} resource conflict{conflicts.length === 1 ? '' : 's'}:
+            </Typography>
+            {conflicts.map((c) => (
+              <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
+                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+              </Typography>
+            ))}
           </Alert>
         )}
 

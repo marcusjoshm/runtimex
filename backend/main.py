@@ -290,7 +290,35 @@ def update_experiment(experiment_id):
         exp_orm.description = experiment.description
         db.session.commit()
 
-    return jsonify(experiment_to_dict(experiment))
+    # Surface conflicts on save so the Designer can warn without an extra
+    # round-trip. We attach them to the response payload; we do NOT emit
+    # ``resource_conflict`` notifications here -- that's U7's job, which will
+    # call back into ``Scheduler.check_for_conflicts`` from this same path.
+    payload = experiment_to_dict(experiment)
+    payload["conflicts"] = Scheduler.check_for_conflicts(experiment)
+    return jsonify(payload)
+
+@app.route('/api/experiments/<experiment_id>/conflicts', methods=['GET'])
+@jwt_required()
+def get_experiment_conflicts(experiment_id):
+    """Return the resource-conflict list for one experiment.
+
+    Existence-privacy mirrors ``get_experiment``: an unrelated user gets 404
+    rather than 403 so they can't probe IDs to confirm membership.
+
+    The payload shape matches what ``Scheduler.check_for_conflicts`` returns
+    in-process, so the round-trip equals the local call (validated by tests).
+    Notifications for these conflicts land in U7 -- this route is a pure read.
+    """
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
+    experiment = scheduler.experiments.get(experiment_id)
+    if not experiment or not can_view_experiment(user, experiment):
+        return jsonify({'error': 'Experiment not found'}), 404
+
+    return jsonify(Scheduler.check_for_conflicts(experiment))
+
 
 def _find_experiment_for_step(step_id):
     """Locate the experiment that owns a step. Helper for step-state routes."""
