@@ -46,3 +46,8 @@ node_modules/
 *.swp
 *.swo
 .DS_Store venv/
+
+# SQLite databases (dev/test)
+runtimex.db
+runtimex-smoke.db
+*.db-journal

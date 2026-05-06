@@ -21,7 +21,17 @@ try:
 except ImportError:
     pass
 
-from models import Experiment, Step, StepStatus, StepType
+from db import db, init_db
+from models import (
+    Experiment,
+    Step,
+    StepStatus,
+    StepType,
+    ExperimentORM,
+    StepORM,
+    TemplateORM,
+    UserORM,
+)
 from scheduler import Scheduler
 import auth
 
@@ -50,11 +60,19 @@ if not jwt_secret:
 app.config["JWT_SECRET_KEY"] = jwt_secret
 jwt = JWTManager(app)
 
+# Initialize SQLAlchemy + create tables. Must run before any route handler
+# that issues a query (auth routes call UserORM.query at request time).
+init_db(app)
+
 # Initialize auth routes and get the user getter function
 get_user = auth.register_auth_routes(app, jwt)
 
-# Update the scheduler to track experiment ownership
-scheduler.user_experiments = {}  # username -> [experiment_ids]
+# Hydrate the scheduler cache from DB so existing experiments survive restart.
+with app.app_context():
+    try:
+        scheduler.hydrate_from_db()
+    except Exception as e:
+        logger.warning("Scheduler hydration skipped: %s", e)
 
 # Initialize notification service with socketio
 notification_service = NotificationService(socketio)
@@ -169,39 +187,40 @@ def create_experiment():
         experiment.add_step(step)
     
     scheduler.add_experiment(experiment)
-    
-    # Track experiment ownership
-    if username not in scheduler.user_experiments:
-        scheduler.user_experiments[username] = []
-    scheduler.user_experiments[username].append(experiment.id)
-    
+
     if experiment.steps:
         start_time = datetime.now()
         scheduler.calculate_initial_schedule(start_time=start_time)
-    
+
     return jsonify(experiment_to_dict(experiment)), 201
 
 @app.route('/api/experiments/<experiment_id>', methods=['PUT'])
 def update_experiment(experiment_id):
-    # Update an existing experiment
+    """Update an experiment, preserving in-flight step state.
+
+    Replaces the previous wipe-and-recreate behaviour (which lost RUNNING
+    step status + actual_start_time on every save). Steps are upserted by
+    ID: surviving IDs keep their runtime state; missing IDs are removed;
+    new IDs are added.
+    """
     experiment = scheduler.experiments.get(experiment_id)
     if not experiment:
         return jsonify({'error': 'Experiment not found'}), 404
-    
-    data = request.json
-    
+
+    data = request.json or {}
+
     # Update basic info
     experiment.name = data.get('name', experiment.name)
     experiment.description = data.get('description', experiment.description)
-    
-    # For a real app, we'd need a more sophisticated way to sync steps
-    # This is simplistic - it removes all existing steps and adds new ones
+
     if 'steps' in data:
-        experiment.steps = {}  # Clear existing steps
-        
+        # Build a list of incoming Step objects. If the client sends an `id`
+        # we honor it (used by existing-step edits); otherwise we mint a new
+        # one (treated as a brand-new step).
+        incoming = []
         for step_data in data['steps']:
             duration_minutes = int(step_data.get('duration', 0))
-            step = Step(
+            new_step = Step(
                 name=step_data['name'],
                 duration=timedelta(minutes=duration_minutes),
                 step_type=StepType(step_data.get('type', 'fixed_duration')),
@@ -209,12 +228,24 @@ def update_experiment(experiment_id):
                 notes=step_data.get('notes'),
                 resource_needed=step_data.get('resourceNeeded')
             )
-            experiment.add_step(step)
-        
-        # Recalculate schedule
+            if step_data.get('id'):
+                new_step.id = step_data['id']
+            incoming.append(new_step)
+
+        scheduler.upsert_experiment_steps(experiment, incoming)
+
+        # Recalculate schedule for any newly-added (PENDING) steps. Existing
+        # RUNNING/COMPLETED steps are skipped by calculate_initial_schedule.
         start_time = datetime.now()
         scheduler.calculate_initial_schedule(start_time=start_time)
-    
+
+    # Persist top-level field updates (name, description) too.
+    exp_orm = db.session.get(ExperimentORM, experiment.id)
+    if exp_orm is not None:
+        exp_orm.name = experiment.name
+        exp_orm.description = experiment.description
+        db.session.commit()
+
     return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/steps/<step_id>/start', methods=['POST'])
@@ -285,22 +316,33 @@ def complete_step(step_id):
 @jwt_required()
 def get_user_experiments():
     username = get_jwt_identity()
-    
-    # Get experiments owned by user
-    user_experiment_ids = scheduler.user_experiments.get(username, [])
+
+    # Owned experiments come from the DB (no more scheduler.user_experiments).
+    owned_orms = ExperimentORM.query.filter_by(owner=username).all()
     experiments = []
-    
-    for exp_id in user_experiment_ids:
-        if exp_id in scheduler.experiments:
-            experiments.append(experiment_to_dict(scheduler.experiments[exp_id]))
-    
-    # Get experiments shared with user
+    seen_ids = set()
+    for orm in owned_orms:
+        # Pull from the cache if present (it carries any in-flight runtime
+        # state); otherwise fall back to the ORM-converted dataclass.
+        exp = scheduler.experiments.get(orm.id) or orm.to_dataclass()
+        experiments.append(experiment_to_dict(exp))
+        seen_ids.add(orm.id)
+
+    # Shared experiments still live on the user dataclass for now (U3 will
+    # normalize this into a real share table).
     user = get_user(username)
     if user:
         for exp_id in user.shared_experiments:
-            if exp_id in scheduler.experiments:
-                experiments.append(experiment_to_dict(scheduler.experiments[exp_id]))
-    
+            if exp_id in seen_ids:
+                continue
+            shared = scheduler.experiments.get(exp_id)
+            if shared is None:
+                shared_orm = db.session.get(ExperimentORM, exp_id)
+                shared = shared_orm.to_dataclass() if shared_orm else None
+            if shared is not None:
+                experiments.append(experiment_to_dict(shared))
+                seen_ids.add(exp_id)
+
     return jsonify(experiments)
 
 # Add route to share an experiment
@@ -333,10 +375,18 @@ def share_experiment(experiment_id):
     if not share_with_user:
         return jsonify({"error": "User to share with not found"}), 404
     
-    # Share the experiment
+    # Share the experiment (in-memory + DB).
     experiment.shared_with[share_with_username] = permission
     share_with_user.shared_experiments[experiment_id] = permission
-    
+
+    # Persist the experiment's shared_with map.
+    exp_orm = db.session.get(ExperimentORM, experiment_id)
+    if exp_orm is not None:
+        exp_orm.shared_with = dict(experiment.shared_with)
+    # Persist the recipient's shared_experiments map.
+    auth.persist_user(share_with_user)
+    db.session.commit()
+
     return jsonify({"message": f"Experiment shared with {share_with_username}"}), 200
 
 # Add export experiment endpoint
@@ -433,21 +483,16 @@ def import_experiment():
             )
             experiment.add_step(step)
         
-        # Add to scheduler
+        # Add to scheduler (persists to DB).
         scheduler.add_experiment(experiment)
-        
-        # Track experiment ownership
-        if username not in scheduler.user_experiments:
-            scheduler.user_experiments[username] = []
-        scheduler.user_experiments[username].append(experiment.id)
-        
+
         # Calculate initial schedule
         if experiment.steps:
             start_time = datetime.now()
             scheduler.calculate_initial_schedule(start_time=start_time)
-        
+
         return jsonify(experiment_to_dict(experiment)), 201
-        
+
     except json.JSONDecodeError:
         return jsonify({"error": "Invalid JSON file"}), 400
     except Exception as e:
@@ -458,121 +503,82 @@ def import_experiment():
 @jwt_required()
 def get_templates():
     username = get_jwt_identity()
-    
-    # In a real app, templates would be stored in a database
-    # For now, we'll use a simple in-memory store
-    if not hasattr(scheduler, 'templates'):
-        scheduler.templates = {}
-    
-    # Get templates for the user
-    user_templates = scheduler.templates.get(username, [])
-    return jsonify(user_templates)
+    rows = TemplateORM.query.filter_by(owner=username).order_by(TemplateORM.created_at.desc()).all()
+    return jsonify([r.to_dict() for r in rows])
 
 @app.route('/api/templates', methods=['POST'])
 @jwt_required()
 def create_template():
     username = get_jwt_identity()
-    data = request.json
-    
-    # Validate input
+    data = request.json or {}
+
     if 'experimentId' not in data or 'name' not in data:
         return jsonify({"error": "Experiment ID and template name are required"}), 400
-    
+
     experiment_id = data['experimentId']
     template_name = data['name']
-    
-    # Get experiment
+
     experiment = scheduler.experiments.get(experiment_id)
     if not experiment:
         return jsonify({"error": "Experiment not found"}), 404
-    
-    # Check ownership (only owner can create templates)
+
     if getattr(experiment, 'owner', None) != username:
         return jsonify({"error": "Only the owner can create templates from this experiment"}), 403
-    
-    # Create template data (simplified experiment)
-    template_data = {
-        'id': str(uuid.uuid4()),
-        'name': template_name,
-        'source_experiment_id': experiment_id,
-        'created_at': datetime.now().isoformat(),
-        'steps': []
-    }
-    
-    # Add steps (without status/timing info)
+
+    steps_payload = []
     for step_id, step in experiment.steps.items():
-        template_data['steps'].append({
+        steps_payload.append({
             'name': step.name,
             'type': step.step_type.value,
             'duration': step.duration.total_seconds() // 60,
             'dependencies': step.dependencies,
             'notes': step.notes,
-            'resourceNeeded': step.resource_needed
+            'resourceNeeded': step.resource_needed,
         })
-    
-    # Store template
-    if not hasattr(scheduler, 'templates'):
-        scheduler.templates = {}
-    
-    if username not in scheduler.templates:
-        scheduler.templates[username] = []
-    
-    scheduler.templates[username].append(template_data)
-    
-    return jsonify(template_data), 201
+
+    template = TemplateORM(
+        id=str(uuid.uuid4()),
+        owner=username,
+        name=template_name,
+        source_experiment_id=experiment_id,
+        steps_payload=steps_payload,
+    )
+    db.session.add(template)
+    db.session.commit()
+
+    return jsonify(template.to_dict()), 201
 
 @app.route('/api/templates/<template_id>', methods=['DELETE'])
 @jwt_required()
 def delete_template(template_id):
     username = get_jwt_identity()
-    
-    # Check if templates exist
-    if not hasattr(scheduler, 'templates') or username not in scheduler.templates:
+    template = TemplateORM.query.filter_by(id=template_id, owner=username).first()
+    if template is None:
         return jsonify({"error": "Template not found"}), 404
-    
-    # Find and remove template
-    for i, template in enumerate(scheduler.templates[username]):
-        if template['id'] == template_id:
-            del scheduler.templates[username][i]
-            return jsonify({"message": "Template deleted"}), 200
-    
-    return jsonify({"error": "Template not found"}), 404
+    db.session.delete(template)
+    db.session.commit()
+    return jsonify({"message": "Template deleted"}), 200
 
 @app.route('/api/experiments/create-from-template/<template_id>', methods=['POST'])
 @jwt_required()
 def create_from_template(template_id):
     username = get_jwt_identity()
-    
-    # Check if templates exist
-    if not hasattr(scheduler, 'templates') or username not in scheduler.templates:
+
+    template = TemplateORM.query.filter_by(id=template_id, owner=username).first()
+    if template is None:
         return jsonify({"error": "Template not found"}), 404
-    
-    # Find template
-    template = None
-    for t in scheduler.templates[username]:
-        if t['id'] == template_id:
-            template = t
-            break
-    
-    if not template:
-        return jsonify({"error": "Template not found"}), 404
-    
-    # Get experiment name from request or use template name
+
     data = request.json or {}
-    name = data.get('name', f"{template['name']} - Copy")
-    
-    # Create a new experiment
+    name = data.get('name', f"{template.name} - Copy")
+
     experiment = Experiment(
         name=name,
         description=data.get('description', '')
     )
-    
-    # Add ownership information
     experiment.owner = username
     experiment.shared_with = {}
-    
-    # Add steps from template
-    for step_data in template['steps']:
+
+    for step_data in (template.steps_payload or []):
         duration_minutes = int(step_data.get('duration', 0))
         step = Step(
             name=step_data['name'],
@@ -583,20 +589,13 @@ def create_from_template(template_id):
             resource_needed=step_data.get('resourceNeeded', '')
         )
         experiment.add_step(step)
-    
-    # Add to scheduler
+
     scheduler.add_experiment(experiment)
-    
-    # Track experiment ownership
-    if username not in scheduler.user_experiments:
-        scheduler.user_experiments[username] = []
-    scheduler.user_experiments[username].append(experiment.id)
-    
-    # Calculate initial schedule
+
     if experiment.steps:
         start_time = datetime.now()
         scheduler.calculate_initial_schedule(start_time=start_time)
-    
+
     return jsonify(experiment_to_dict(experiment)), 201
 
 # Add notification routes
