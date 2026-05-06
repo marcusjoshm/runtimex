@@ -118,54 +118,79 @@ const NotificationCenter: React.FC<NotificationCenterProps> = ({ onActionExecute
     return true;
   });
 
+  // Unread count drives the badge on the trigger button.
+  const unreadCount = notifications.filter(
+    n => !n.is_read && !n.is_dismissed
+  ).length;
+
   return (
-    <Drawer
-      open={open}
-      onClose={handleClose}
-      PaperProps={{
-        sx: {
-          width: 350,
-          padding: 2,
-        },
-      }}
-    >
-      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-        <Typography variant="h6" sx={{ padding: 2 }}>
-          Notifications
-        </Typography>
-        <Divider />
-        <Tabs
-          value={tab}
-          onChange={handleTabChange}
-          variant="fullWidth"
-          sx={{ flexGrow: 1 }}
-        >
-          <Tab label="Unread" />
-          <Tab label="Dismissed" />
-        </Tabs>
-        <List>
-          {filteredNotifications.map((notification) => (
-            <ListItem key={notification.id}>
-              <IconButton onClick={() => handleMarkAsRead(notification)}>
-                {getNotificationIcon(notification.type, notification.priority)}
-              </IconButton>
-              <ListItemText
-                primary={notification.title}
-                secondary={notification.message}
-              />
-              <IconButton onClick={() => handleDismiss(notification)}>
-                <DeleteIcon />
-              </IconButton>
-            </ListItem>
-          ))}
-        </List>
-        <Divider />
-        <Box sx={{ padding: 2, display: 'flex', justifyContent: 'space-between' }}>
-          <Button onClick={handleClose}>Close</Button>
-          <Button onClick={handleOpen}>Refresh</Button>
+    <>
+      {/* Trigger button + badge. Rendered inside whatever toolbar mounts us
+          (AppHeader at present). The drawer below is portaled by MUI so the
+          trigger placement does not constrain its layout. */}
+      <IconButton
+        color="inherit"
+        onClick={handleOpen}
+        aria-label="notifications"
+        aria-controls="notification-drawer"
+        aria-haspopup="true"
+        size="large"
+      >
+        <Badge badgeContent={unreadCount} color="error">
+          <NotificationsIcon />
+        </Badge>
+      </IconButton>
+
+      <Drawer
+        id="notification-drawer"
+        anchor="right"
+        open={open}
+        onClose={handleClose}
+        PaperProps={{
+          sx: {
+            width: 350,
+            padding: 2,
+          },
+        }}
+      >
+        <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+          <Typography variant="h6" sx={{ padding: 2 }}>
+            Notifications
+          </Typography>
+          <Divider />
+          <Tabs
+            value={tab}
+            onChange={handleTabChange}
+            variant="fullWidth"
+            sx={{ flexGrow: 1 }}
+          >
+            <Tab label="Unread" />
+            <Tab label="Dismissed" />
+          </Tabs>
+          <List>
+            {filteredNotifications.map((notification) => (
+              <ListItem key={notification.id}>
+                <IconButton onClick={() => handleMarkAsRead(notification)}>
+                  {getNotificationIcon(notification.type, notification.priority)}
+                </IconButton>
+                <ListItemText
+                  primary={notification.title}
+                  secondary={notification.message}
+                />
+                <IconButton onClick={() => handleDismiss(notification)}>
+                  <DeleteIcon />
+                </IconButton>
+              </ListItem>
+            ))}
+          </List>
+          <Divider />
+          <Box sx={{ padding: 2, display: 'flex', justifyContent: 'space-between' }}>
+            <Button onClick={handleClose}>Close</Button>
+            <Button onClick={handleOpen}>Refresh</Button>
+          </Box>
         </Box>
-      </Box>
-    </Drawer>
+      </Drawer>
+    </>
   );
 };
 

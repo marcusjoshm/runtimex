@@ -164,33 +164,46 @@ class NotificationService {
     }
   }
 
-  // Mark a notification as read
+  // Mark a notification as read.
+  //
+  // U7 audit-fix: previously this mutated ``notification.is_read`` in place
+  // before notifying listeners, so ``setNotifications(newNotifications)`` in
+  // a React listener received the SAME array reference and skipped re-render.
+  // We now build a fresh array with a fresh notification object so listeners
+  // see a different reference and re-render. NOTE FOR U8: U8 will rename the
+  // wire format and consolidate the two socket connections in this file --
+  // preserve this mapped-array shape; do not regress to mutate-in-place.
   public async markAsRead(notificationId: string) {
     try {
       await axios.post(`${API_URL}/notifications/${notificationId}/read`);
-      
-      // Update local state
-      const notification = this.notifications.find(n => n.id === notificationId);
-      if (notification) {
-        notification.is_read = true;
-        this.notifyListeners();
-      }
+
+      // Update local state with a NEW array + NEW object for the changed entry.
+      this.notifications = Array.isArray(this.notifications)
+        ? this.notifications.map(n =>
+            n.id === notificationId ? { ...n, is_read: true } : n
+          )
+        : this.notifications;
+      this.notifyListeners();
     } catch (error) {
       console.error('Failed to mark notification as read:', error);
     }
   }
 
-  // Dismiss a notification
+  // Dismiss a notification.
+  //
+  // U7 audit-fix: same in-place mutation bug as ``markAsRead`` above. See
+  // that comment for context. NOTE FOR U8: keep the mapped-array pattern.
   public async dismissNotification(notificationId: string) {
     try {
       await axios.post(`${API_URL}/notifications/${notificationId}/dismiss`);
-      
-      // Update local state
-      const notification = this.notifications.find(n => n.id === notificationId);
-      if (notification) {
-        notification.is_dismissed = true;
-        this.notifyListeners();
-      }
+
+      // Update local state with a NEW array + NEW object for the changed entry.
+      this.notifications = Array.isArray(this.notifications)
+        ? this.notifications.map(n =>
+            n.id === notificationId ? { ...n, is_dismissed: true } : n
+          )
+        : this.notifications;
+      this.notifyListeners();
     } catch (error) {
       console.error('Failed to dismiss notification:', error);
     }

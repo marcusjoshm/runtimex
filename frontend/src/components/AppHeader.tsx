@@ -13,6 +13,7 @@ import {
 } from '@mui/material';
 import TimerIcon from '@mui/icons-material/Timer';
 import authClient, { User } from '../api/auth';
+import NotificationCenter from './NotificationCenter';
 
 const AppHeader: React.FC = () => {
   const navigate = useNavigate();
@@ -53,7 +54,12 @@ const AppHeader: React.FC = () => {
         
         {currentUser ? (
           <>
-            <IconButton 
+            {/* NotificationCenter renders its own bell IconButton + Badge
+                trigger, plus a right-side Drawer it manages itself. Mounting
+                it here keeps the toolbar layout flat (icon -> avatar) without
+                AppHeader having to track drawer-open state. */}
+            <NotificationCenter />
+            <IconButton
               onClick={handleMenuOpen}
               size="small"
               aria-controls="user-menu"

@@ -291,11 +291,14 @@ def update_experiment(experiment_id):
         db.session.commit()
 
     # Surface conflicts on save so the Designer can warn without an extra
-    # round-trip. We attach them to the response payload; we do NOT emit
-    # ``resource_conflict`` notifications here -- that's U7's job, which will
-    # call back into ``Scheduler.check_for_conflicts`` from this same path.
+    # round-trip. We also fan out one ``resource_conflict`` notification per
+    # detected pair to the experiment's owner (U7). Notifications go to the
+    # owner only; share-recipients are intentionally out of scope here and
+    # tracked as a deferred follow-up.
+    conflicts = Scheduler.check_for_conflicts(experiment)
+    _emit_resource_conflict_notifications(experiment, conflicts)
     payload = experiment_to_dict(experiment)
-    payload["conflicts"] = Scheduler.check_for_conflicts(experiment)
+    payload["conflicts"] = conflicts
     return jsonify(payload)
 
 @app.route('/api/experiments/<experiment_id>/conflicts', methods=['GET'])
@@ -364,6 +367,79 @@ def _emit_experiment_update(experiment):
         logger.warning("experiment_update emit failed: %s", exc)
 
 
+def _snapshot_step_statuses(experiment):
+    """Capture {step_id: status} so we can detect newly-READY steps post-update."""
+    return {sid: s.status for sid, s in experiment.steps.items()}
+
+
+def _emit_step_ready_notifications(experiment, prev_status_map):
+    """Emit one ``step_ready`` notification per dependent that just unblocked.
+
+    Compares the post-transition step statuses against ``prev_status_map``
+    and fans out a single notification (to ``experiment.owner``) for each
+    step that transitioned to ``READY`` since the snapshot. The
+    ``add_notification`` call also writes one ``NotificationORM`` row per
+    target user, so a logged-out owner still finds the notification on next
+    login -- the SocketIO emit is best-effort.
+    """
+    owner = getattr(experiment, "owner", None)
+    if not owner:
+        return
+    for step_id, step in experiment.steps.items():
+        prev = prev_status_map.get(step_id)
+        if step.status == StepStatus.READY and prev != StepStatus.READY:
+            notification = notification_factories["step_ready"](
+                step, experiment, target_users=[owner]
+            )
+            try:
+                notification_service.add_notification(notification)
+            except Exception as exc:
+                logger.warning("step_ready notification emit failed: %s", exc)
+
+
+def _emit_step_completed_notification(step, experiment):
+    """Emit a single ``step_completed`` notification to the experiment's owner.
+
+    Used for both ``complete`` and ``skip`` routes -- a skipped step is a
+    completion from the dependents' perspective, so the same notification
+    surfaces "this is no longer blocking downstream work".
+    """
+    owner = getattr(experiment, "owner", None)
+    if not owner:
+        return
+    notification = notification_factories["step_completed"](
+        step, experiment, target_users=[owner]
+    )
+    try:
+        notification_service.add_notification(notification)
+    except Exception as exc:
+        logger.warning("step_completed notification emit failed: %s", exc)
+
+
+def _emit_resource_conflict_notifications(experiment, conflicts):
+    """Emit one ``resource_conflict`` notification per detected conflict pair.
+
+    Called from ``update_experiment`` after the conflict scan runs. We send
+    only to the experiment's owner here -- share-recipients are intentionally
+    out of scope for U7 and tracked as a deferred follow-up.
+    """
+    owner = getattr(experiment, "owner", None)
+    if not owner or not conflicts:
+        return
+    for conflict in conflicts:
+        step_a = experiment.steps.get(conflict["step_a"])
+        step_b = experiment.steps.get(conflict["step_b"])
+        if step_a is None or step_b is None:
+            continue
+        notification = notification_factories["resource_conflict"](
+            step_a, step_b, experiment, conflict["resource"], target_users=[owner]
+        )
+        try:
+            notification_service.add_notification(notification)
+        except Exception as exc:
+            logger.warning("resource_conflict notification emit failed: %s", exc)
+
+
 @app.route('/api/steps/<step_id>/start', methods=['POST'])
 @jwt_required()
 def start_step(step_id):
@@ -393,7 +469,18 @@ def complete_step(step_id):
     if err is not None:
         return err
 
+    # Snapshot per-step status BEFORE the transition. handle_step_complete
+    # runs update_ready_status internally, which can flip dependents to
+    # READY -- we diff against this snapshot to fan out ``step_ready``
+    # notifications for exactly the steps that just unblocked.
+    prev_status_map = _snapshot_step_statuses(experiment)
     scheduler.handle_step_complete(step_id)
+
+    # Notification fan-out (U7). The completed step gets one ``step_completed``
+    # notification; each newly-READY dependent gets its own ``step_ready``.
+    _emit_step_completed_notification(step, experiment)
+    _emit_step_ready_notifications(experiment, prev_status_map)
+
     _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
 
@@ -421,6 +508,7 @@ def skip_step(step_id):
     # Drive the transition through the dataclass so ``elapsed_time`` /
     # ``actual_*`` stay coherent (a half-run step that gets skipped keeps the
     # work it accumulated, but no end time).
+    prev_status_map = _snapshot_step_statuses(experiment)
     step.update_status(StepStatus.SKIPPED)
     # Persist the new status and recompute READY for dependents.
     scheduler._persist_step_state(step)
@@ -432,6 +520,12 @@ def skip_step(step_id):
         # No app context (test helpers occasionally hit this); the in-memory
         # cache still reflects the change.
         pass
+
+    # Notification fan-out (U7). Skip is treated like completion for
+    # downstream-dependent purposes -- a skipped step is "done blocking"
+    # whether or not it ran to completion.
+    _emit_step_completed_notification(step, experiment)
+    _emit_step_ready_notifications(experiment, prev_status_map)
 
     _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
@@ -805,68 +899,6 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     print('Client disconnected')
-
-# Update existing handlers to trigger notifications
-
-# Modify handle_step_start to send notifications
-def handle_step_start(step_id, start_time=None):
-    # Existing step start logic...
-    
-    # Send notification for next ready step
-    for step in scheduler.schedule.values():
-        if step.status == StepStatus.READY:
-            # Find the experiment for this step
-            for exp in scheduler.experiments.values():
-                if step.id in exp.steps:
-                    notification = notification_factories["step_ready"](step, exp)
-                    notification_service.create_notification(notification)
-                    break
-
-# Modify handle_step_complete to send notifications
-def handle_step_complete(step_id, end_time=None):
-    # Get the step before completing it
-    step = scheduler.get_step(step_id)
-    
-    # Find the experiment
-    experiment = None
-    for exp in scheduler.experiments.values():
-        if step_id in exp.steps:
-            experiment = exp
-            break
-    
-    # Complete the step
-    # Existing step complete logic...
-    
-    # Send completion notification
-    if experiment:
-        notification = notification_factories["step_completed"](step, experiment)
-        notification_service.create_notification(notification)
-    
-    # Check for resource conflicts in newly ready steps
-    check_resource_conflicts()
-
-# Add resource conflict detection
-def check_resource_conflicts():
-    running_resources = {}  # resource -> step
-    
-    # Find all running steps and their resources
-    for step in scheduler.schedule.values():
-        if step.status == StepStatus.RUNNING and step.resource_needed:
-            if step.resource_needed in running_resources:
-                # Conflict detected!
-                conflicting_step = running_resources[step.resource_needed]
-                
-                # Find the experiment
-                for exp in scheduler.experiments.values():
-                    if step.id in exp.steps or conflicting_step.id in exp.steps:
-                        experiment = exp
-                        notification = notification_factories["resource_conflict"](
-                            step, conflicting_step, experiment, step.resource_needed
-                        )
-                        notification_service.create_notification(notification)
-                        break
-            else:
-                running_resources[step.resource_needed] = step
 
 if __name__ == "__main__":
     # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000.
