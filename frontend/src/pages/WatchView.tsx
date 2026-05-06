@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { Box, Typography, Button, CircularProgress } from '@mui/material';
-import apiClient, { Experiment, Step } from '../api/client';
+import apiClient, { Step } from '../api/client';
 import socketService from '../api/socket';
 
 // Status constants
@@ -17,7 +17,10 @@ const StepStatus = {
 
 const WatchView: React.FC = () => {
   const { experimentId } = useParams<{ experimentId: string }>();
-  const [experiment, setExperiment] = useState<Experiment | null>(null);
+  // The full experiment object isn't read anywhere in this view -- the only
+  // thing the JSX renders is ``activeStep``. Tracking it as state caused an
+  // ESLint unused-variable warning and an extra re-render per socket update,
+  // so we drop the experiment-state binding and feed activeStep directly.
   const [loading, setLoading] = useState(true);
   const [activeStep, setActiveStep] = useState<Step | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -30,13 +33,12 @@ const WatchView: React.FC = () => {
       try {
         setLoading(true);
         const data = await apiClient.getExperiment(experimentId);
-        setExperiment(data);
-        
+
         // Find the current active step (RUNNING or first READY)
         const runningStep = data.steps.find(step => step.status === StepStatus.RUNNING);
         const readyStep = data.steps.find(step => step.status === StepStatus.READY);
         setActiveStep(runningStep || readyStep || null);
-        
+
         setLoading(false);
       } catch (err) {
         console.error('Failed to fetch experiment:', err);
@@ -45,22 +47,20 @@ const WatchView: React.FC = () => {
     };
 
     fetchExperiment();
-    
+
     // Set up socket connection
     socketService.initializeSocket();
     socketService.startExperimentUpdates(experimentId);
-    
+
     const unsubscribe = socketService.onExperimentUpdate((updatedExperiment) => {
       if (updatedExperiment.id === experimentId) {
-        setExperiment(updatedExperiment);
-        
         // Update active step
         const runningStep = updatedExperiment.steps.find(step => step.status === StepStatus.RUNNING);
         const readyStep = updatedExperiment.steps.find(step => step.status === StepStatus.READY);
         setActiveStep(runningStep || readyStep || null);
       }
     });
-    
+
     return () => {
       unsubscribe();
       socketService.disconnectSocket();

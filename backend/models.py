@@ -71,6 +71,13 @@ class Step:
             scheduled_start_time + duration if scheduled_start_time else None
         )
         self.actual_start_time: Optional[datetime] = None
+        # ``first_start_time`` is set ONLY on the very first start() call and
+        # is never overwritten on resume-after-pause. It exists for reporting:
+        # ``actual_start_time`` is repurposed on resume to point at the latest
+        # resume instant (so we can compute "time since last resume" without
+        # storing both fields). If you need "when did this step originally
+        # begin", read ``first_start_time``.
+        self.first_start_time: Optional[datetime] = None
         self.actual_end_time: Optional[datetime] = None
         self.elapsed_time: timedelta = timedelta(0) # Time accumulated while running
         self.status: StepStatus = StepStatus.PENDING
@@ -80,15 +87,33 @@ class Step:
         self.earliest_possible_start_time: Optional[datetime] = None # Calculated by scheduler
 
     def start(self, start_time: Optional[datetime] = None):
-        """Marks the step as started."""
+        """Marks the step as started.
+
+        Two cases:
+
+        * From READY: the very first start of this step. We set both
+          ``actual_start_time`` and ``first_start_time`` to ``now``, leave
+          ``elapsed_time`` at zero.
+        * From PAUSED: a resume. We update ``actual_start_time`` to ``now``
+          (so "now - actual_start_time" measures time since the latest
+          resume) and DO NOT touch ``elapsed_time``. ``elapsed_time`` already
+          holds the accumulated work from prior runs; ``pause()`` adds the
+          most-recent run's slice to it, and ``complete()`` adds the final
+          slice. Resetting elapsed_time here would silently drop prior work.
+          ``first_start_time`` is preserved across resumes.
+        """
         if self.status not in [StepStatus.READY, StepStatus.PAUSED]:
              # Consider raising an error or logging a warning
              print(f"Warning: Cannot start step '{self.name}' with status {self.status.value}")
              return
 
         self.actual_start_time = start_time or datetime.now()
+        # Set first_start_time only on the FIRST start. Resumes (status was
+        # PAUSED) leave it untouched so it can answer "when did this step
+        # originally begin?" for reports.
+        if self.first_start_time is None:
+            self.first_start_time = self.actual_start_time
         self.status = StepStatus.RUNNING
-        # Reset elapsed time if restarting after pause? Or accumulate? Let's accumulate for now.
         print(f"Step '{self.name}' started at {self.actual_start_time}")
 
     def pause(self):
@@ -128,21 +153,43 @@ class Step:
         print(f"Step '{self.name}' status updated to {status.value}")
 
     def get_expected_end_time(self) -> Optional[datetime]:
-        """Calculates the expected end time based on start time and duration."""
-        if self.actual_start_time:
-             # If running or paused, calculate based on elapsed time
-             if self.status in [StepStatus.RUNNING, StepStatus.PAUSED]:
-                 remaining_time = self.duration - self.elapsed_time
-                 if remaining_time < timedelta(0): remaining_time = timedelta(0) # Ensure not negative
-                 # For running step, expected end is now + remaining
-                 # For paused step, we don't know when it will resume, so this is less certain
-                 # Let's just return start + duration for simplicity for now, scheduler will refine
-                 return self.actual_start_time + self.duration # Simplified view
-             elif self.status == StepStatus.COMPLETED and self.actual_end_time:
-                 return self.actual_end_time
+        """Compute the expected wall-clock end time, accounting for elapsed.
+
+        Cases:
+
+        * RUNNING: the most recent resume happened at ``actual_start_time``,
+          and ``elapsed_time`` holds work accumulated from earlier runs (zero
+          if this is the first run). Time still owed = ``duration - elapsed``.
+          Expected end = ``actual_start_time + (duration - elapsed_time)``.
+          Note: this is correct even on the first run because elapsed=0 then,
+          which collapses to ``actual_start_time + duration``.
+        * PAUSED: not currently accruing time. If we resumed right now we'd
+          finish ``duration - elapsed_time`` later, so expected end =
+          ``now + (duration - elapsed_time)``.
+        * COMPLETED: return ``actual_end_time`` verbatim.
+        * Anything else (PENDING/READY/SKIPPED/ERROR): fall back to
+          ``scheduled_start_time + duration`` if we have one, else ``None``.
+
+        Remaining time is floored at zero so a step that's already over its
+        budget doesn't return an end time before its start.
+        """
+        if self.status == StepStatus.COMPLETED and self.actual_end_time:
+            return self.actual_end_time
+
+        if self.status == StepStatus.RUNNING and self.actual_start_time:
+            remaining = self.duration - self.elapsed_time
+            if remaining < timedelta(0):
+                remaining = timedelta(0)
+            return self.actual_start_time + remaining
+
+        if self.status == StepStatus.PAUSED:
+            remaining = self.duration - self.elapsed_time
+            if remaining < timedelta(0):
+                remaining = timedelta(0)
+            return datetime.now() + remaining
 
         if self.scheduled_start_time:
-             return self.scheduled_start_time + self.duration
+            return self.scheduled_start_time + self.duration
 
         return None # Not enough info to determine
 
@@ -313,6 +360,10 @@ class StepORM(db.Model):
     scheduled_start_time = Column(DateTime, nullable=True)
     scheduled_end_time = Column(DateTime, nullable=True)
     actual_start_time = Column(DateTime, nullable=True)
+    # ``first_start_time`` records the very first start() and is never
+    # overwritten by resume-after-pause; ``actual_start_time`` always points
+    # at the latest start/resume. Both are needed for accurate reporting.
+    first_start_time = Column(DateTime, nullable=True)
     actual_end_time = Column(DateTime, nullable=True)
     elapsed_seconds = Column(Float, nullable=False, default=0.0)
     earliest_possible_start_time = Column(DateTime, nullable=True)
@@ -347,6 +398,7 @@ class StepORM(db.Model):
             scheduled_start_time=step.scheduled_start_time,
             scheduled_end_time=step.scheduled_end_time,
             actual_start_time=step.actual_start_time,
+            first_start_time=getattr(step, "first_start_time", None),
             actual_end_time=step.actual_end_time,
             elapsed_seconds=step.elapsed_time.total_seconds() if step.elapsed_time else 0.0,
             earliest_possible_start_time=step.earliest_possible_start_time,
@@ -370,6 +422,7 @@ class StepORM(db.Model):
         self.scheduled_start_time = step.scheduled_start_time
         self.scheduled_end_time = step.scheduled_end_time
         self.actual_start_time = step.actual_start_time
+        self.first_start_time = getattr(step, "first_start_time", None)
         self.actual_end_time = step.actual_end_time
         self.elapsed_seconds = step.elapsed_time.total_seconds() if step.elapsed_time else 0.0
         self.earliest_possible_start_time = step.earliest_possible_start_time
@@ -388,6 +441,7 @@ class StepORM(db.Model):
         step.scheduled_start_time = self.scheduled_start_time
         step.scheduled_end_time = self.scheduled_end_time
         step.actual_start_time = self.actual_start_time
+        step.first_start_time = self.first_start_time
         step.actual_end_time = self.actual_end_time
         step.elapsed_time = timedelta(seconds=self.elapsed_seconds or 0.0)
         step.earliest_possible_start_time = self.earliest_possible_start_time

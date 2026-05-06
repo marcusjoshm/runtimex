@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Box,
@@ -66,6 +66,16 @@ const ExperimentRunner: React.FC = () => {
   const [conflicts, setConflicts] = useState<{ step1: Step, step2: Step }[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+
+  // ``experimentRef`` exists so the once-per-mount tick interval below can
+  // read the latest experiment without listing it as an effect dependency.
+  // Without it, the interval would tear down + rebuild every second a step
+  // is RUNNING (the audit's runaway-tick bug). The companion effect below
+  // keeps the ref synced on every render.
+  const experimentRef = useRef<Experiment | null>(null);
+  useEffect(() => {
+    experimentRef.current = experiment;
+  }, [experiment]);
 
   // Initialize socket connection
   useEffect(() => {
@@ -197,38 +207,71 @@ const ExperimentRunner: React.FC = () => {
     fetchExperiment();
   }, [experimentId]);
 
-  // Update current time every second and track elapsed time
+  // Auto-complete handler kept stable via useCallback so the timer effect
+  // below can list it in deps without re-creating the interval. The actual
+  // interval reads experiment via a ref, not the closure.
+  const handleStepComplete = useCallback(async (stepId: string) => {
+    try {
+      const updatedExperiment = await apiClient.completeStep(stepId);
+      setExperiment(updatedExperiment);
+
+      // Find next READY step and set as active
+      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
+      if (nextReadyIndex !== -1) {
+        setActiveStepIndex(nextReadyIndex);
+      } else {
+        // No more ready steps
+        setActiveStepIndex(null);
+      }
+    } catch (err) {
+      console.error('Failed to complete step:', err);
+      alert('Failed to complete step. Please try again.');
+    }
+  }, []);
+
+  // Stable ref to the latest handleStepComplete so the once-per-mount
+  // interval below never closes over a stale callback.
+  const handleStepCompleteRef = useRef(handleStepComplete);
+  useEffect(() => {
+    handleStepCompleteRef.current = handleStepComplete;
+  }, [handleStepComplete]);
+
+  // Per-second tick: refresh ``currentTime`` so the running-step elapsed
+  // counter re-renders, and auto-complete any FIXED_DURATION step that has
+  // run past its budget.
+  //
+  // We deliberately use ``[]`` deps and read the latest ``experiment`` from
+  // a ref. The previous implementation depended on ``experiment`` and called
+  // ``setExperiment`` inside the tick, which triggered a re-render -> effect
+  // teardown -> new interval every single second (the audit's runaway-tick
+  // bug). Now the interval is created exactly once on mount and torn down
+  // on unmount.
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTime(new Date());
-      
-      // Update running steps with elapsed time
-      if (experiment) {
-        const updatedSteps = experiment.steps.map(step => {
-          if (step.status === StepStatus.RUNNING && step.actualStartTime) {
-            const elapsed = differenceInSeconds(new Date(), parseISO(step.actualStartTime));
-            return { ...step, elapsedTime: elapsed };
+
+      const current = experimentRef.current;
+      if (!current) return;
+
+      // Auto-complete fixed-duration steps whose elapsed seconds have hit
+      // their budget. We compute elapsed from actualStartTime each tick so
+      // we don't rely on the server for sub-second polling.
+      current.steps.forEach((step) => {
+        if (
+          step.status === StepStatus.RUNNING &&
+          step.type === StepType.FIXED_DURATION &&
+          step.actualStartTime
+        ) {
+          const elapsed = differenceInSeconds(new Date(), parseISO(step.actualStartTime));
+          if (elapsed >= step.duration * 60) {
+            handleStepCompleteRef.current(step.id);
           }
-          return step;
-        });
-        
-        setExperiment({ ...experiment, steps: updatedSteps });
-        
-        // Auto-complete fixed duration steps if they have finished
-        updatedSteps.forEach((step) => {
-          if (step.status === StepStatus.RUNNING && 
-              step.type === StepType.FIXED_DURATION && 
-              step.actualStartTime && 
-              step.elapsedTime && 
-              step.elapsedTime >= step.duration * 60) {
-            handleStepComplete(step.id);
-          }
-        });
-      }
+        }
+      });
     }, 1000);
-    
+
     return () => clearInterval(timer);
-  }, [experiment]);
+  }, []);
 
   // Handle step actions
   const handleStepStart = async (stepId: string) => {
@@ -291,47 +334,25 @@ const ExperimentRunner: React.FC = () => {
     }
   };
 
-  const handleStepComplete = async (stepId: string) => {
-    if (!experiment) return;
-    
-    try {
-      const updatedExperiment = await apiClient.completeStep(stepId);
-      setExperiment(updatedExperiment);
-      
-      // Find next READY step and set as active
-      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
-      if (nextReadyIndex !== -1) {
-        setActiveStepIndex(nextReadyIndex);
-      } else {
-        // No more ready steps
-        setActiveStepIndex(null);
-      }
-    } catch (err) {
-      console.error('Failed to complete step:', err);
-      alert('Failed to complete step. Please try again.');
-    }
-  };
+  // ``handleStepComplete`` lives near the top of the component as a stable
+  // useCallback so the per-second tick effect can reference it without
+  // re-creating the interval. See the comment block above the timer effect.
 
   const handleStepSkip = async (stepId: string) => {
     if (!experiment) return;
-    
+
+    // Server-sourced state: POST /api/steps/<id>/skip and let the resulting
+    // ``experiment_update`` socket push (or the HTTP response) update local
+    // state. Don't optimistically mutate ``experiment`` here -- doing that
+    // is what lets two tabs of the same experiment drift, and what made the
+    // pre-U5 client think a step was SKIPPED while the server still had it
+    // RUNNING.
     try {
-      // For now, just mark as completed in UI
-      // In a real app, there would be a skip endpoint
-      const updatedSteps = experiment.steps.map(step => {
-        if (step.id === stepId) {
-          return {
-            ...step,
-            status: StepStatus.SKIPPED
-          };
-        }
-        return step;
-      });
-      
-      setExperiment({...experiment, steps: updatedSteps});
-      
+      const updatedExperiment = await apiClient.skipStep(stepId);
+      setExperiment(updatedExperiment);
+
       // Find next READY step and set as active
-      const nextReadyIndex = updatedSteps.findIndex(step => step.status === StepStatus.READY);
+      const nextReadyIndex = updatedExperiment.steps.findIndex(step => step.status === StepStatus.READY);
       if (nextReadyIndex !== -1) {
         setActiveStepIndex(nextReadyIndex);
       } else {

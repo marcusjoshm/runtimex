@@ -125,6 +125,14 @@ def experiment_to_dict(experiment):
             step_dict['scheduledEndTime'] = step.scheduled_end_time.isoformat()
         if step.actual_start_time:
             step_dict['actualStartTime'] = step.actual_start_time.isoformat()
+        # ``first_start_time`` survives pause/resume cycles. Reports rely on it
+        # to answer "when did this step originally begin?" since
+        # ``actual_start_time`` is overwritten on every resume. Serialized as
+        # camelCase to match the rest of the experiment payload (U8 normalizes
+        # the whole wire format to snake_case).
+        first_start_time = getattr(step, 'first_start_time', None)
+        if first_start_time:
+            step_dict['firstStartTime'] = first_start_time.isoformat()
         if step.actual_end_time:
             step_dict['actualEndTime'] = step.actual_end_time.isoformat()
         if step.elapsed_time:
@@ -315,6 +323,19 @@ def _authorize_step_transition(step_id):
     return step, experiment, None
 
 
+def _emit_experiment_update(experiment):
+    """Push the latest experiment snapshot to every connected client.
+
+    All step-transition routes call this after a successful mutation so any
+    open Runner / WatchView re-renders without polling. The payload shape
+    matches the REST GET response, so frontend handlers don't need to branch.
+    """
+    try:
+        socketio.emit('experiment_update', experiment_to_dict(experiment))
+    except Exception as exc:
+        logger.warning("experiment_update emit failed: %s", exc)
+
+
 @app.route('/api/steps/<step_id>/start', methods=['POST'])
 @jwt_required()
 def start_step(step_id):
@@ -323,6 +344,7 @@ def start_step(step_id):
         return err
 
     scheduler.handle_step_start(step_id)
+    _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/steps/<step_id>/pause', methods=['POST'])
@@ -333,6 +355,7 @@ def pause_step(step_id):
         return err
 
     scheduler.handle_step_pause(step_id)
+    _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
 
 @app.route('/api/steps/<step_id>/complete', methods=['POST'])
@@ -343,6 +366,46 @@ def complete_step(step_id):
         return err
 
     scheduler.handle_step_complete(step_id)
+    _emit_experiment_update(experiment)
+    return jsonify(experiment_to_dict(experiment))
+
+
+@app.route('/api/steps/<step_id>/skip', methods=['POST'])
+@jwt_required()
+def skip_step(step_id):
+    """Mark a step as SKIPPED.
+
+    Mirrors ``complete_step``'s shape: same auth, same permission gate, same
+    return type. Differences:
+
+    * Status transitions to ``SKIPPED`` instead of ``COMPLETED``.
+    * No ``actual_end_time`` is recorded -- a skipped step never ran.
+    * Newly-unblocked dependents are recomputed via ``update_ready_status``
+      so a step that depended on this one becomes READY.
+
+    Notification emits live in U7; this route only fires the
+    ``experiment_update`` socket message.
+    """
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
+    # Drive the transition through the dataclass so ``elapsed_time`` /
+    # ``actual_*`` stay coherent (a half-run step that gets skipped keeps the
+    # work it accumulated, but no end time).
+    step.update_status(StepStatus.SKIPPED)
+    # Persist the new status and recompute READY for dependents.
+    scheduler._persist_step_state(step)
+    scheduler.update_ready_status()
+    try:
+        for s in scheduler.schedule.values():
+            scheduler._persist_step_state(s)
+    except RuntimeError:
+        # No app context (test helpers occasionally hit this); the in-memory
+        # cache still reflects the change.
+        pass
+
+    _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
 
 # Add a route to get user's experiments

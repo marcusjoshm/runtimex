@@ -67,6 +67,11 @@ const apiClient = {
     return response.data;
   },
 
+  skipStep: async (stepId: string): Promise<Experiment> => {
+    const response = await axios.post(`${API_URL}/steps/${stepId}/skip`);
+    return response.data;
+  },
+
   getUserExperiments: async (): Promise<Experiment[]> => {
     const response = await axios.get(`${API_URL}/user/experiments`);
     return response.data;
