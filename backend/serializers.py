@@ -67,6 +67,13 @@ def step_to_dict(step) -> Dict[str, Any]:
     if step.elapsed_time:
         out["elapsed_seconds"] = step.elapsed_time.total_seconds()
 
+    # U3: only emit ``inherits_elapsed_from`` when set, matching the existing
+    # "skip None fields" pattern. The frontend treats absence and null
+    # interchangeably; the round-trip stays clean.
+    inherits = getattr(step, "inherits_elapsed_from", None)
+    if inherits:
+        out["inherits_elapsed_from"] = inherits
+
     return out
 
 

@@ -164,6 +164,10 @@ def _step_from_payload(step_data: dict) -> Step:
         notes=step_data.get('notes'),
         resource_needed=step_data.get('resource_required'),
         condition_id=step_data.get('condition_id'),
+        # U3 cascading time: round-trip the opt-in inherit directive. Either a
+        # sibling Step's id (within the same Condition) or the literal
+        # "previous". Resolution lives in start_step (below).
+        inherits_elapsed_from=step_data.get('inherits_elapsed_from'),
     )
 
 
@@ -495,12 +499,128 @@ def _emit_resource_conflict_notifications(experiment, conflicts):
             logger.warning("resource_conflict notification emit failed: %s", exc)
 
 
+def _resolve_inherits_elapsed(step, experiment):
+    """U3: resolve ``step.inherits_elapsed_from`` to a source Step's elapsed.
+
+    Called from ``start_step`` BEFORE ``Step.start()`` runs, so the seed
+    survives the dataclass's own ``elapsed_time`` reset semantics: ``start()``
+    from READY leaves elapsed_time alone (it's already 0 by construction), so
+    pre-populating the dataclass here is enough to flow through to the ORM
+    via ``_persist_step_state``.
+
+    Resolution rules:
+      * ``"previous"`` -> the immediately preceding Step in the SAME Condition
+        ordered by ``created_at`` (the canonical order_by on ``StepORM.steps``
+        and ``ConditionORM.steps``). Falls back to dict insertion order on the
+        dataclass since it mirrors ``ConditionORM.steps``'s order_by.
+      * Any other string -> treated as a Step id; must be in the SAME
+        Condition.
+
+    The seed only fires when the source step has ``actual_end_time`` set
+    (i.e. has COMPLETED). Otherwise we log a warning and proceed with
+    ``elapsed_time = 0``. Cross-Condition references log a warning and skip.
+    First-step-in-Condition case (``"previous"`` with no preceding sibling)
+    silently treats as no-inherit -- ``elapsed_time = 0`` is the natural
+    "nothing to inherit" outcome.
+
+    Pure side-effect on ``step.elapsed_time``; returns nothing.
+    """
+    directive = getattr(step, "inherits_elapsed_from", None)
+    if not directive:
+        return
+    if step.status != StepStatus.READY:
+        # Resume-from-PAUSED already has accumulated elapsed_time; don't clobber it.
+        return
+
+    source = None
+    if directive == "previous":
+        # Order siblings by created_at via the ORM (the dataclass cache loses
+        # that detail). Fall back to insertion order if we can't reach the ORM
+        # (e.g., bare-Scheduler test harnesses without app context).
+        siblings = [
+            s for s in experiment.steps.values()
+            if getattr(s, "condition_id", None) == step.condition_id
+        ]
+        try:
+            from models import StepORM as _StepORM
+            ordered_ids = [
+                row.id for row in (
+                    db.session.query(_StepORM)
+                    .filter(_StepORM.experiment_id == experiment.id)
+                    .filter(_StepORM.condition_id == step.condition_id)
+                    .order_by(_StepORM.created_at)
+                    .all()
+                )
+            ]
+            if ordered_ids:
+                # Reorder dataclass siblings to match created_at order. Steps
+                # not present in ordered_ids (mid-add edge cases) drop out.
+                by_id = {s.id: s for s in siblings}
+                siblings = [by_id[sid] for sid in ordered_ids if sid in by_id]
+        except RuntimeError:
+            pass
+
+        # Find the immediate predecessor.
+        predecessor = None
+        for s in siblings:
+            if s.id == step.id:
+                break
+            predecessor = s
+        if predecessor is None:
+            logger.warning(
+                "inherits_elapsed_from='previous' on step '%s' has no preceding "
+                "sibling in condition %s; proceeding with elapsed=0",
+                step.name, step.condition_id,
+            )
+            return
+        source = predecessor
+    else:
+        source = experiment.steps.get(directive)
+        if source is None:
+            logger.warning(
+                "inherits_elapsed_from='%s' on step '%s' references unknown "
+                "step id; proceeding with elapsed=0",
+                directive, step.name,
+            )
+            return
+        if getattr(source, "condition_id", None) != step.condition_id:
+            logger.warning(
+                "inherits_elapsed_from='%s' on step '%s' references a step in "
+                "a different Condition (%s vs %s); proceeding with elapsed=0",
+                directive, step.name, source.condition_id, step.condition_id,
+            )
+            return
+
+    # Source must have COMPLETED for the seed to be meaningful. A still-RUNNING
+    # source has no final elapsed yet -- skip with a warning rather than seed
+    # from a partial value (which would silently double-count when the source
+    # eventually finishes).
+    if source.actual_end_time is None:
+        logger.warning(
+            "inherits_elapsed_from on step '%s' references step '%s' which has "
+            "not completed yet; proceeding with elapsed=0",
+            step.name, source.name,
+        )
+        return
+
+    step.elapsed_time = source.elapsed_time
+    logger.info(
+        "Step '%s' inheriting elapsed=%ss from '%s'",
+        step.name, step.elapsed_time.total_seconds(), source.name,
+    )
+
+
 @app.route('/api/steps/<step_id>/start', methods=['POST'])
 @jwt_required()
 def start_step(step_id):
     step, experiment, err = _authorize_step_transition(step_id)
     if err is not None:
         return err
+
+    # U3: pre-seed elapsed_time from a sibling before Step.start() flips status.
+    # The seed must happen before scheduler.handle_step_start() so the
+    # _persist_step_state call inside picks up the new elapsed_seconds value.
+    _resolve_inherits_elapsed(step, experiment)
 
     scheduler.handle_step_start(step_id)
     _emit_experiment_update(experiment)

@@ -26,6 +26,8 @@ import {
   DialogActions,
   DialogContentText,
   FormHelperText,
+  FormControlLabel,
+  Switch,
   SelectChangeEvent,
   Stack,
 } from '@mui/material';
@@ -63,6 +65,13 @@ interface Step {
   // currently-first Condition (or a Main Condition we'll auto-create) so the
   // user never has to pick on every Add Step click.
   condition_id: string;
+  // U3 cascading time: opt-in inherit directive. Stored on the Designer-local
+  // state as the same string the wire carries -- "previous" (the only value
+  // the Designer UI surfaces today) or undefined for "no inherit". The
+  // toggle in the step editor writes "previous"; we deliberately don't expose
+  // a sibling-id picker yet because the brainstorm's primary case is the
+  // wash -> re-incubate adjacency.
+  inherits_elapsed_from?: string;
 }
 
 interface Experiment {
@@ -199,6 +208,7 @@ const ExperimentDesigner: React.FC = () => {
             notes: s.notes,
             resource_required: s.resource_required,
             condition_id: s.condition_id || fallbackConditionId,
+            inherits_elapsed_from: s.inherits_elapsed_from,
           })),
         });
       })
@@ -466,6 +476,12 @@ const ExperimentDesigner: React.FC = () => {
         notes: s.notes,
         resource_required: s.resource_required,
         condition_id: s.condition_id,
+        // U3: only send the field when the user actually opted in. The
+        // serializer round-trips with "skip None" so an undefined here lands
+        // as a missing key on the wire.
+        ...(s.inherits_elapsed_from
+          ? { inherits_elapsed_from: s.inherits_elapsed_from }
+          : {}),
       })),
     };
 
@@ -998,6 +1014,57 @@ const ExperimentDesigner: React.FC = () => {
                 rows={3}
               />
             </Grid>
+            {/* U3 cascading time: only surface the toggle when the step has
+                at least one preceding sibling in its Condition. For the first
+                step in a Condition there's nothing to inherit from -- hiding
+                the control prevents the user from setting a directive that
+                would silently no-op at START (with a warning log on the
+                server). The "preceding" check uses the live editor state, so
+                reordering steps in the Designer updates eligibility without
+                a save round-trip. */}
+            {currentStep && (() => {
+              const sameConditionSteps = experiment.steps.filter(
+                (s) => s.condition_id === currentStep.condition_id
+              );
+              const indexInCondition = sameConditionSteps.findIndex(
+                (s) => s.id === currentStep.id
+              );
+              // For a brand-new step (not yet committed to experiment.steps)
+              // ``editStepIndex`` is null and the step's id won't match any
+              // sibling. Treat that as "appended at the end of the
+              // condition", so any existing sibling counts as preceding.
+              const hasPreceding =
+                editStepIndex === null
+                  ? sameConditionSteps.length > 0
+                  : indexInCondition > 0;
+              if (!hasPreceding) return null;
+              const inheritOn = currentStep.inherits_elapsed_from === 'previous';
+              return (
+                <Grid item xs={12}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={inheritOn}
+                        onChange={(e) =>
+                          setCurrentStep({
+                            ...currentStep,
+                            inherits_elapsed_from: e.target.checked
+                              ? 'previous'
+                              : undefined,
+                          })
+                        }
+                      />
+                    }
+                    label="Inherit elapsed time from previous step"
+                  />
+                  <FormHelperText>
+                    When enabled, this step's countdown begins as if the previous
+                    step's elapsed time has already accrued (e.g., a 4-minute wash
+                    eats into a 30-minute re-incubation, leaving 26 minutes).
+                  </FormHelperText>
+                </Grid>
+              );
+            })()}
           </Grid>
         </DialogContent>
         <DialogActions>

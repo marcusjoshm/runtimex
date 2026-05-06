@@ -49,7 +49,8 @@ class Step:
         notes: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, # For extra info specific to a step type
         resource_needed: Optional[str] = None, # e.g., 'microscope', 'user_attention', 'oven'
-        condition_id: Optional[str] = None # The Condition this step belongs to. Required for persisted steps; nullable here so legacy callers that don't yet specify it still work in tests, but persistence enforces non-null.
+        condition_id: Optional[str] = None, # The Condition this step belongs to. Required for persisted steps; nullable here so legacy callers that don't yet specify it still work in tests, but persistence enforces non-null.
+        inherits_elapsed_from: Optional[str] = None, # U3 cascading time: the source Step's id, or the literal "previous". Resolution happens server-side in main.start_step before Step.start() runs (see backend/main.py). Default None = no inherit; the field is opt-in per-Step.
     ):
         self.id: str = str(uuid.uuid4()) # Unique identifier for the step
         self.name: str = name
@@ -60,6 +61,11 @@ class Step:
         self.metadata: Dict[str, Any] = metadata if metadata else {}
         self.resource_needed: Optional[str] = resource_needed
         self.condition_id: Optional[str] = condition_id
+        # U3: opt-in cascading time. When set, the route layer (main.start_step)
+        # resolves this to a sibling Step in the same Condition and pre-seeds
+        # ``elapsed_time`` from the source's final elapsed BEFORE start() runs.
+        # See backend/main.py for the resolution rules.
+        self.inherits_elapsed_from: Optional[str] = inherits_elapsed_from
 
         # Default resource needed based on type (can be overridden)
         if self.resource_needed is None:
@@ -510,6 +516,13 @@ class StepORM(db.Model):
     earliest_possible_start_time = Column(DateTime, nullable=True)
     latest_allowed_start_time = Column(DateTime, nullable=True)
 
+    # U3 cascading time: opt-in source for elapsed-time inheritance. Either a
+    # sibling Step's id (within the same Condition) or the literal string
+    # "previous" (resolved server-side to the immediately preceding Step in the
+    # Condition's created_at order). Nullable; the resolver in main.start_step
+    # is the only writer of seeded elapsed_seconds.
+    inherits_elapsed_from = Column(String, nullable=True)
+
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     experiment = relationship("ExperimentORM", back_populates="steps")
@@ -546,6 +559,7 @@ class StepORM(db.Model):
             elapsed_seconds=step.elapsed_time.total_seconds() if step.elapsed_time else 0.0,
             earliest_possible_start_time=step.earliest_possible_start_time,
             latest_allowed_start_time=step.latest_allowed_start_time,
+            inherits_elapsed_from=getattr(step, "inherits_elapsed_from", None),
         )
 
     def apply_dataclass(self, step: "Step") -> None:
@@ -573,6 +587,10 @@ class StepORM(db.Model):
         self.elapsed_seconds = step.elapsed_time.total_seconds() if step.elapsed_time else 0.0
         self.earliest_possible_start_time = step.earliest_possible_start_time
         self.latest_allowed_start_time = step.latest_allowed_start_time
+        # U3: persist the inherit pointer through edit + state-mutation paths.
+        # Required so a server restart mid-run preserves the seeded elapsed
+        # alongside the directive that caused the seed.
+        self.inherits_elapsed_from = getattr(step, "inherits_elapsed_from", None)
 
     def to_dataclass(self) -> "Step":
         step = Step.__new__(Step)
@@ -593,6 +611,7 @@ class StepORM(db.Model):
         step.elapsed_time = timedelta(seconds=self.elapsed_seconds or 0.0)
         step.earliest_possible_start_time = self.earliest_possible_start_time
         step.latest_allowed_start_time = self.latest_allowed_start_time
+        step.inherits_elapsed_from = self.inherits_elapsed_from
         # Dependency IDs are stored on the dataclass as a list of step IDs.
         step.dependencies = [d.id for d in (self.dependencies or [])]
         return step

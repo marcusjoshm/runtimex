@@ -95,6 +95,13 @@ def _run_migrations() -> None:
             logger.info("Adding steps.condition_id column (legacy DB upgrade)")
             with bind.begin() as conn:
                 conn.execute(text("ALTER TABLE steps ADD COLUMN condition_id TEXT"))
+        # U3: cascading time directive. Column is nullable + default NULL so
+        # the ADD COLUMN works without a backfill -- existing rows simply have
+        # no inherit, which matches the opt-in semantics.
+        if "inherits_elapsed_from" not in step_cols:
+            logger.info("Adding steps.inherits_elapsed_from column (U3 cascading time)")
+            with bind.begin() as conn:
+                conn.execute(text("ALTER TABLE steps ADD COLUMN inherits_elapsed_from TEXT"))
 
     # 2. Backfill: every Experiment without any Conditions gets a "Main"
     #    Condition; that Experiment's Steps inherit its id.

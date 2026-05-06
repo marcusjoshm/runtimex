@@ -31,6 +31,14 @@ export interface Step {
   // Condition this step belongs to. Always present for persisted steps once
   // U1 is shipped; legacy data is auto-backfilled to a "Main" Condition.
   condition_id?: string;
+  // U3 cascading time: opt-in directive copied verbatim from the wire. Either
+  // the literal string "previous" (server resolves to the immediately
+  // preceding sibling in the same Condition) or a sibling Step's id. Absent /
+  // undefined means "no inherit". The Designer's per-step toggle writes
+  // "previous"; the Runner does NOT re-derive countdown from this field --
+  // the server pre-seeds elapsed_seconds on START so the existing
+  // ``duration_seconds - elapsed_seconds`` math just works.
+  inherits_elapsed_from?: string;
 }
 
 // Condition: a named grouping of steps within an Experiment. Multiple
