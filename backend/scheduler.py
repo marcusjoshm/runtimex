@@ -495,6 +495,106 @@ class Scheduler:
         else:
             print(f"Error: Cannot handle completion for unknown step ID {step_id}")
 
+    # ------------------------------------------------------------------
+    # U5 live-edit helpers
+    # ------------------------------------------------------------------
+    def extend_step_duration(
+        self,
+        step: Step,
+        delta_seconds: int,
+    ) -> Tuple[bool, Optional[str]]:
+        """Apply a duration delta to ``step`` with shrink-clamp semantics.
+
+        Returns ``(changed, warning)``:
+
+        * ``changed`` is True iff anything actually moved on the step (caller
+          uses this to decide whether to re-run conflict detection / persist).
+        * ``warning`` is a human-readable string when shrink-clamp triggered,
+          else ``None``. The route layer surfaces this in the response JSON.
+
+        Behavior:
+
+        * Positive delta extends; negative shrinks.
+        * Shrinking that would make ``duration_seconds < elapsed_seconds`` is
+          clamped to ``elapsed_seconds + 1`` so a RUNNING step never has its
+          duration fall below already-elapsed time (which would yield negative
+          remaining time and chaotic countdown UX). The plan's contract.
+        * ``scheduled_end_time`` is re-derived if a ``scheduled_start_time``
+          exists. Downstream PENDING/READY siblings are handled by the route
+          via ``calculate_initial_schedule``; this helper only mutates the
+          target step.
+        * ``prewarnings_fired`` is intentionally NOT reset on extend: the user
+          extended deliberately and doesn't need a re-fire of warnings they
+          already saw. Documented as a U4 landmine in the U5 commit notes.
+        """
+        if delta_seconds == 0:
+            return False, None
+
+        current_seconds = step.duration.total_seconds()
+        new_seconds = current_seconds + delta_seconds
+
+        warning: Optional[str] = None
+        elapsed_seconds = (
+            step.elapsed_time.total_seconds() if step.elapsed_time else 0.0
+        )
+        if new_seconds < elapsed_seconds + 1:
+            new_seconds = elapsed_seconds + 1
+            warning = "duration clamped to current elapsed"
+
+        step.duration = timedelta(seconds=new_seconds)
+        if step.scheduled_start_time:
+            step.scheduled_end_time = step.scheduled_start_time + step.duration
+
+        try:
+            self._persist_step_state(step)
+        except RuntimeError:
+            # No app context (bare-Scheduler test harness); cache mutation
+            # already happened in-place, so callers see the change either way.
+            pass
+        return True, warning
+
+    def push_condition(
+        self,
+        experiment: Experiment,
+        condition_id: str,
+        delta_seconds: int,
+    ) -> bool:
+        """Shift PENDING/READY steps in a Condition by ``delta_seconds``.
+
+        RUNNING / COMPLETED / SKIPPED / PAUSED / ERROR steps are intentionally
+        left in place: a push reflects a forward-looking schedule slip, never
+        rewriting work already done or in progress. Returns True if anything
+        actually moved (caller uses this to decide whether to persist + emit).
+
+        ``delta_seconds == 0`` is treated as a no-op at the caller layer; this
+        helper still honors the same contract by returning ``False`` without
+        touching any state.
+        """
+        if delta_seconds == 0:
+            return False
+
+        delta = timedelta(seconds=delta_seconds)
+        moved = False
+        for step in experiment.steps.values():
+            if getattr(step, "condition_id", None) != condition_id:
+                continue
+            if step.status not in (StepStatus.PENDING, StepStatus.READY):
+                continue
+            if step.scheduled_start_time:
+                step.scheduled_start_time = step.scheduled_start_time + delta
+                moved = True
+            if step.scheduled_end_time:
+                step.scheduled_end_time = step.scheduled_end_time + delta
+                moved = True
+
+        if moved:
+            try:
+                self._persist_experiment(experiment)
+            except RuntimeError:
+                # No app context -- in-memory cache still reflects the change.
+                pass
+        return moved
+
     def get_upcoming_steps(self, window: timedelta = timedelta(hours=1)) -> List[Step]:
         """Returns steps that are scheduled or expected to start soon."""
         now = datetime.now()

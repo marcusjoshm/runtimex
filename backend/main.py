@@ -738,6 +738,140 @@ def skip_step(step_id):
     _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
 
+# ---------------------------------------------------------------------------
+# U5 reactive live-edit routes.
+#
+# Two narrow operations the Runner / Designer use to react when reality drifts:
+#
+#   * POST /api/steps/<id>/extend  -- "+5m / -5m" on the active step.
+#   * POST /api/conditions/<id>/push -- "shift this whole Condition by N min".
+#
+# Both follow the same shape as existing step-state routes: JWT-gated,
+# permission-gated, persist via the scheduler, run conflict detection, emit
+# ``experiment_update``, return ``{experiment, conflicts}``.
+# ---------------------------------------------------------------------------
+def _coerce_delta_seconds(payload):
+    """Pull a signed integer ``delta_seconds`` out of a JSON body.
+
+    Accepts numeric strings ("300", "-60") for client-side flexibility; rejects
+    anything non-numeric. Returns ``(delta, error_response)`` so callers can
+    surface a 400 directly without re-implementing the same try/except.
+    """
+    if not isinstance(payload, dict):
+        return None, (jsonify({'error': 'JSON body required'}), 400)
+    raw = payload.get('delta_seconds')
+    if raw is None:
+        return None, (jsonify({'error': 'delta_seconds is required'}), 400)
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, (jsonify({'error': 'delta_seconds must be an integer'}), 400)
+
+
+@app.route('/api/steps/<step_id>/extend', methods=['POST'])
+@jwt_required()
+def extend_step(step_id):
+    """Reactive extend/shrink on the active (or any future) step.
+
+    Wire contract:
+      Request:  ``{"delta_seconds": <int>}`` -- positive extends, negative
+                shrinks. Zero is treated as a no-op (still returns 200 with
+                the current experiment payload so clients can retry idempotently).
+      Response: ``{...experiment_to_dict..., "conflicts": [...], "warning"?: str}``
+
+    Permission policy mirrors other step-state routes via
+    ``_authorize_step_transition``: 404 when the user can't view the parent
+    experiment (existence-privacy), 403 when they can view but not edit.
+
+    Shrink-clamp semantics: a negative delta that would push duration below
+    the step's current ``elapsed_seconds`` clamps to ``elapsed_seconds + 1``
+    and surfaces a ``warning`` field in the response. Plan's contract.
+    """
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
+    delta, err = _coerce_delta_seconds(request.json or {})
+    if err is not None:
+        return err
+
+    changed, warning = scheduler.extend_step_duration(step, delta)
+    if changed:
+        # Re-derive scheduled times for downstream PENDING/READY siblings. The
+        # current step's own scheduled_end_time was already updated inline in
+        # extend_step_duration; calculate_initial_schedule only touches PENDING
+        # steps, so RUNNING/COMPLETED siblings stay put.
+        scheduler.calculate_initial_schedule(start_time=datetime.now())
+        _emit_experiment_update(experiment)
+
+    conflicts = Scheduler.check_for_conflicts(experiment)
+    payload = experiment_to_dict(experiment)
+    payload["conflicts"] = conflicts
+    if warning:
+        payload["warning"] = warning
+    return jsonify(payload)
+
+
+@app.route('/api/conditions/<condition_id>/push', methods=['POST'])
+@jwt_required()
+def push_condition(condition_id):
+    """Shift PENDING/READY steps in a Condition by ``delta_seconds``.
+
+    Wire contract:
+      Request:  ``{"delta_seconds": <int>}``
+      Response: ``{...experiment_to_dict..., "conflicts": [...]}``
+
+    Permission policy: existence-privacy on the parent experiment. We resolve
+    the condition's parent by walking ``scheduler.experiments`` (same pattern
+    as ``_find_experiment_for_step``), so a foreign condition_id and a
+    non-existent condition_id are indistinguishable from the caller's view --
+    both produce 404.
+
+    ``delta_seconds == 0`` is a documented no-op: no DB write, no socket emit,
+    just the current experiment payload. Clients sending zero (e.g. a
+    debounced UI control that snapped to zero) shouldn't see phantom traffic.
+    """
+    delta, err = _coerce_delta_seconds(request.json or {})
+    if err is not None:
+        return err
+
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
+    # Resolve the parent experiment by walking the cache. We don't expose
+    # condition existence to unauthorized callers -- the 404 path covers both
+    # "no such condition" and "condition belongs to an experiment you can't
+    # view".
+    experiment = None
+    for exp in scheduler.experiments.values():
+        if condition_id in (exp.conditions or {}):
+            experiment = exp
+            break
+
+    if experiment is None or not can_view_experiment(user, experiment):
+        return jsonify({'error': 'Condition not found'}), 404
+    if not can_edit_experiment(user, experiment):
+        return jsonify({'error': 'edit permission required'}), 403
+
+    if delta == 0:
+        # No-op path: skip DB write + socket emit but still return the
+        # experiment payload + conflicts so clients can use the response
+        # uniformly with the non-zero path.
+        conflicts = Scheduler.check_for_conflicts(experiment)
+        payload = experiment_to_dict(experiment)
+        payload["conflicts"] = conflicts
+        return jsonify(payload)
+
+    moved = scheduler.push_condition(experiment, condition_id, delta)
+    if moved:
+        _emit_experiment_update(experiment)
+
+    conflicts = Scheduler.check_for_conflicts(experiment)
+    payload = experiment_to_dict(experiment)
+    payload["conflicts"] = conflicts
+    return jsonify(payload)
+
+
 # Add a route to get user's experiments
 @app.route('/api/user/experiments', methods=['GET'])
 @jwt_required()

@@ -21,7 +21,9 @@ import {
   ListItemText,
   Divider,
   IconButton,
-  Alert
+  Alert,
+  ButtonGroup,
+  Snackbar
 } from '@mui/material';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PauseIcon from '@mui/icons-material/Pause';
@@ -69,6 +71,14 @@ const ExperimentRunner: React.FC = () => {
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  // U5 live-edit feedback. Both the server's clamp warning and any error
+  // from the extend round-trip surface here. We keep the message and
+  // severity together so the Snackbar can render the right color without a
+  // second piece of state. ``null`` => not visible.
+  const [liveEditFeedback, setLiveEditFeedback] = useState<{
+    message: string;
+    severity: 'success' | 'warning' | 'error';
+  } | null>(null);
 
   // ``experimentRef`` exists so the once-per-mount tick interval below can
   // read the latest experiment without listing it as an effect dependency.
@@ -426,6 +436,47 @@ const ExperimentRunner: React.FC = () => {
     }
   };
 
+  // U5: extend / shrink the active step by a fixed delta (seconds). On 200,
+  // we let the socket's ``experiment_update`` push handle local-state
+  // refresh -- mirrors the existing skip/start/pause/complete pattern that
+  // already lives in this file. The Promise's resolved payload still gets
+  // applied directly so the buttons feel snappy without waiting for the
+  // socket round-trip; both sources converge on the same shape.
+  //
+  // Negative deltas may trigger the server's shrink-clamp; the response
+  // includes a ``warning`` string in that case and we surface it in the
+  // Snackbar. Errors (network / 403 / 404) also land in the Snackbar with
+  // ``severity: 'error'`` so the operator gets a non-blocking signal
+  // without an alert() dialog interrupting the bench flow.
+  const handleExtendStep = async (stepId: string, deltaSeconds: number) => {
+    try {
+      const response = await apiClient.extendStep(stepId, deltaSeconds);
+      setExperiment(response);
+      if (response.warning) {
+        setLiveEditFeedback({ message: response.warning, severity: 'warning' });
+      } else {
+        const sign = deltaSeconds >= 0 ? '+' : '-';
+        const minutes = Math.abs(deltaSeconds) / 60;
+        const label = minutes >= 1
+          ? `${sign}${minutes} min`
+          : `${sign}${Math.abs(deltaSeconds)} sec`;
+        setLiveEditFeedback({
+          message: `Step duration adjusted (${label})`,
+          severity: 'success',
+        });
+      }
+    } catch (err: any) {
+      console.error('Failed to extend step:', err);
+      const status = err?.response?.status;
+      const detail =
+        err?.response?.data?.error ||
+        (status === 403 ? 'Edit permission required'
+         : status === 404 ? 'Step not found'
+         : 'Failed to adjust step duration');
+      setLiveEditFeedback({ message: detail, severity: 'error' });
+    }
+  };
+
   const showStepDetails = (stepId: string) => {
     setSelectedStepId(stepId);
     setShowInfoDialog(true);
@@ -691,14 +742,54 @@ const ExperimentRunner: React.FC = () => {
                 )}
                 
                 {activeStep.status !== StepStatus.COMPLETED && activeStep.status !== StepStatus.SKIPPED && (
-                  <Button 
-                    color="error" 
+                  <Button
+                    color="error"
                     startIcon={<SkipNextIcon />}
                     onClick={() => handleStepSkip(activeStep.id)}
                   >
                     Skip
                   </Button>
                 )}
+
+                {/* U5 live-edit: extend / shrink the active step. Hidden when
+                    the step is COMPLETED or SKIPPED (no further duration
+                    edits make sense). The server clamps shrinks that would
+                    push duration below current elapsed and surfaces a
+                    warning string we render via the Snackbar below. */}
+                {activeStep.status !== StepStatus.COMPLETED &&
+                  activeStep.status !== StepStatus.SKIPPED && (
+                    <ButtonGroup
+                      size="small"
+                      variant="outlined"
+                      sx={{ ml: 'auto' }}
+                      aria-label="adjust step duration"
+                    >
+                      <Button
+                        onClick={() => handleExtendStep(activeStep.id, -60)}
+                        aria-label="shrink one minute"
+                      >
+                        -1m
+                      </Button>
+                      <Button
+                        onClick={() => handleExtendStep(activeStep.id, 60)}
+                        aria-label="extend one minute"
+                      >
+                        +1m
+                      </Button>
+                      <Button
+                        onClick={() => handleExtendStep(activeStep.id, -300)}
+                        aria-label="shrink five minutes"
+                      >
+                        -5m
+                      </Button>
+                      <Button
+                        onClick={() => handleExtendStep(activeStep.id, 300)}
+                        aria-label="extend five minutes"
+                      >
+                        +5m
+                      </Button>
+                    </ButtonGroup>
+                  )}
               </CardActions>
             </Card>
           </Box>
@@ -810,6 +901,30 @@ const ExperimentRunner: React.FC = () => {
           <Button onClick={() => setShowInfoDialog(false)}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      {/* U5 live-edit feedback. The Snackbar is non-blocking on purpose --
+          extend/shrink is a high-frequency operation at the bench, and a
+          modal alert would interrupt the operator's flow on every tap. The
+          severity comes from handleExtendStep: 'warning' for the
+          shrink-clamp message, 'error' for HTTP failures, 'success' for
+          plain extend confirmation. */}
+      <Snackbar
+        open={liveEditFeedback !== null}
+        autoHideDuration={4000}
+        onClose={() => setLiveEditFeedback(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        {liveEditFeedback ? (
+          <Alert
+            onClose={() => setLiveEditFeedback(null)}
+            severity={liveEditFeedback.severity}
+            variant="filled"
+            sx={{ width: '100%' }}
+          >
+            {liveEditFeedback.message}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
     </Container>
   );
 };

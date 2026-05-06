@@ -105,6 +105,17 @@ export interface Conflict {
 // optional means the Designer can read it uniformly.
 export type ExperimentSaveResponse = Experiment & { conflicts?: Conflict[] };
 
+// U5 live-edit response shape. Both /api/steps/<id>/extend and
+// /api/conditions/<id>/push return the full experiment payload + the
+// post-mutation conflict list. Extend may also return a `warning` string
+// when a negative delta clamps duration to current elapsed.
+export type LiveEditResponse = Experiment & {
+  conflicts: Conflict[];
+  // Only present on extend when shrink-clamp triggered. Surface verbatim in
+  // a Snackbar / Alert; the message is human-readable already.
+  warning?: string;
+};
+
 // Create API client
 const apiClient = {
   // Experiment API methods
@@ -162,6 +173,42 @@ const apiClient = {
 
   skipStep: async (stepId: string): Promise<Experiment> => {
     const response = await axios.post(`${API_BASE}/steps/${stepId}/skip`);
+    return response.data;
+  },
+
+  // U5 live-edit: extend (or shrink) the active step's duration. Positive
+  // ``deltaSeconds`` extends; negative shrinks. The server clamps negative
+  // deltas that would push duration below the current ``elapsed_seconds``
+  // and returns a ``warning`` string in that case -- callers should surface
+  // it (Snackbar / inline Alert) so the user understands why the duration
+  // didn't shrink as much as they asked. The server also re-runs conflict
+  // detection and broadcasts ``experiment_update``, so the Runner socket
+  // subscription will refresh local state independently of this Promise.
+  extendStep: async (
+    stepId: string,
+    deltaSeconds: number
+  ): Promise<LiveEditResponse> => {
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/extend`, {
+      delta_seconds: deltaSeconds,
+    });
+    return response.data;
+  },
+
+  // U5 live-edit: push (shift) a Condition's PENDING/READY steps by
+  // ``deltaSeconds``. RUNNING / COMPLETED / SKIPPED / PAUSED steps are NOT
+  // moved (the operator-facing label clarifies this as "shifts upcoming
+  // steps in this condition"). ``deltaSeconds === 0`` is a documented no-op
+  // -- still returns 200 with the current experiment payload, so callers
+  // don't need to special-case zero. U6 reuses this client method to power
+  // the lane-header push controls.
+  pushCondition: async (
+    conditionId: string,
+    deltaSeconds: number
+  ): Promise<LiveEditResponse> => {
+    const response = await axios.post(
+      `${API_BASE}/conditions/${conditionId}/push`,
+      { delta_seconds: deltaSeconds }
+    );
     return response.data;
   },
 
