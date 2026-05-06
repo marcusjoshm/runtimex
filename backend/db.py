@@ -57,6 +57,7 @@ def init_db(app, database_uri: Optional[str] = None) -> None:
 
     with app.app_context():
         db.create_all()
+        _run_migrations()
 
 
 def reset_db(app) -> None:
@@ -64,3 +65,62 @@ def reset_db(app) -> None:
     with app.app_context():
         db.drop_all()
         db.create_all()
+        _run_migrations()
+
+
+def _run_migrations() -> None:
+    """Idempotent migrations that run after ``db.create_all()``.
+
+    Currently:
+      - Ensures ``steps.condition_id`` column exists (SQLite ALTER TABLE).
+        ``create_all`` skips existing tables, so dev DBs created before the
+        Conditions plan need this fixup. New DBs already have the column.
+      - For each Experiment without any Conditions, creates a default "Main"
+        Condition and assigns the Experiment's existing Steps to it.
+
+    This function MUST be called inside an app context.
+    """
+    from sqlalchemy import inspect, text
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    bind = db.engine
+    inspector = inspect(bind)
+
+    # 1. Ensure steps.condition_id column exists. SQLite ALTER TABLE ADD COLUMN
+    #    is idempotent only via inspection; do it once if missing.
+    if "steps" in inspector.get_table_names():
+        step_cols = {c["name"] for c in inspector.get_columns("steps")}
+        if "condition_id" not in step_cols:
+            logger.info("Adding steps.condition_id column (legacy DB upgrade)")
+            with bind.begin() as conn:
+                conn.execute(text("ALTER TABLE steps ADD COLUMN condition_id TEXT"))
+
+    # 2. Backfill: every Experiment without any Conditions gets a "Main"
+    #    Condition; that Experiment's Steps inherit its id.
+    if "experiments" in inspector.get_table_names() and "conditions" in inspector.get_table_names():
+        with bind.begin() as conn:
+            experiments_lacking_conditions = conn.execute(
+                text(
+                    "SELECT e.id FROM experiments e "
+                    "LEFT JOIN conditions c ON c.experiment_id = e.id "
+                    "WHERE c.id IS NULL"
+                )
+            ).fetchall()
+
+            for (exp_id,) in experiments_lacking_conditions:
+                main_id = str(_uuid.uuid4())
+                conn.execute(
+                    text(
+                        "INSERT INTO conditions (id, experiment_id, name, color, order_index, description, created_at) "
+                        "VALUES (:id, :exp_id, 'Main', 'slate', 0, NULL, :ts)"
+                    ),
+                    {"id": main_id, "exp_id": exp_id, "ts": _dt.utcnow()},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE steps SET condition_id = :cid WHERE experiment_id = :exp_id"
+                    ),
+                    {"cid": main_id, "exp_id": exp_id},
+                )
+                logger.info("Backfilled Main condition %s for experiment %s", main_id, exp_id)

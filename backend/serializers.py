@@ -30,6 +30,10 @@ def step_to_dict(step) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {
         "id": step.id,
+        # ``condition_id`` lets the frontend group steps into swimlanes by
+        # Condition. Always included; never None for persisted steps (the
+        # backfill in db._run_migrations() populates legacy data).
+        "condition_id": getattr(step, "condition_id", None),
         "name": step.name,
         "step_type": step.step_type.value,
         # ``duration_seconds`` is a float -- the source of truth is
@@ -66,6 +70,18 @@ def step_to_dict(step) -> Dict[str, Any]:
     return out
 
 
+def condition_to_dict(condition) -> Dict[str, Any]:
+    """Serialize a single ``Condition`` dataclass to its on-the-wire dict shape."""
+    return {
+        "id": condition.id,
+        "experiment_id": condition.experiment_id,
+        "name": condition.name,
+        "color": condition.color,
+        "order_index": condition.order_index,
+        "description": condition.description,
+    }
+
+
 def experiment_to_dict(experiment) -> Dict[str, Any]:
     """Serialize an ``Experiment`` dataclass to its on-the-wire dict shape.
 
@@ -73,15 +89,26 @@ def experiment_to_dict(experiment) -> Dict[str, Any]:
     ``update_experiment``) layer it on after running ``check_for_conflicts``
     so the conflict list is available alongside the experiment without
     requiring this helper to know about the scheduler.
+
+    Conditions are emitted as a sibling array to steps; each step carries its
+    own ``condition_id`` so the frontend can group steps into Condition
+    swimlanes without a second pass.
     """
     steps: List[Dict[str, Any]] = [
         step_to_dict(step) for _step_id, step in experiment.steps.items()
     ]
 
+    conditions_dict = getattr(experiment, "conditions", {}) or {}
+    conditions: List[Dict[str, Any]] = sorted(
+        (condition_to_dict(c) for c in conditions_dict.values()),
+        key=lambda c: c["order_index"],
+    )
+
     result: Dict[str, Any] = {
         "id": experiment.id,
         "name": experiment.name,
         "description": experiment.description,
+        "conditions": conditions,
         "steps": steps,
     }
 

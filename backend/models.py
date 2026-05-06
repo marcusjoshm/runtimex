@@ -48,7 +48,8 @@ class Step:
         scheduled_start_time: Optional[datetime] = None,
         notes: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, # For extra info specific to a step type
-        resource_needed: Optional[str] = None # e.g., 'microscope', 'user_attention', 'oven'
+        resource_needed: Optional[str] = None, # e.g., 'microscope', 'user_attention', 'oven'
+        condition_id: Optional[str] = None # The Condition this step belongs to. Required for persisted steps; nullable here so legacy callers that don't yet specify it still work in tests, but persistence enforces non-null.
     ):
         self.id: str = str(uuid.uuid4()) # Unique identifier for the step
         self.name: str = name
@@ -58,6 +59,7 @@ class Step:
         self.notes: Optional[str] = notes
         self.metadata: Dict[str, Any] = metadata if metadata else {}
         self.resource_needed: Optional[str] = resource_needed
+        self.condition_id: Optional[str] = condition_id
 
         # Default resource needed based on type (can be overridden)
         if self.resource_needed is None:
@@ -198,6 +200,33 @@ class Step:
                 f"scheduled_start={self.scheduled_start_time}, actual_start={self.actual_start_time}, "
                 f"duration={self.duration})")
 
+# Condition: a named grouping of steps within an Experiment. Multiple conditions
+# run in parallel (e.g., "Dish 1 / Dish 2 / Dish 3"), can share resources, and
+# can drift in shape from each other. Steps belong to exactly one Condition.
+#
+# Step membership is implicit via Step.condition_id, not a list on the Condition,
+# so adding/moving steps doesn't require dual-write to keep the two views in sync.
+class Condition:
+    def __init__(
+        self,
+        experiment_id: str,
+        name: str,
+        color: str = "slate",
+        order_index: int = 0,
+        description: Optional[str] = None,
+        id: Optional[str] = None,
+    ):
+        self.id: str = id or str(uuid.uuid4())
+        self.experiment_id: str = experiment_id
+        self.name: str = name
+        self.color: str = color
+        self.order_index: int = order_index
+        self.description: Optional[str] = description
+
+    def __repr__(self):
+        return f"Condition(id={self.id}, name='{self.name}', color={self.color}, order={self.order_index})"
+
+
 # We will also need an Experiment class to hold these steps
 class Experiment:
     def __init__(self, name: str, description: Optional[str] = None):
@@ -205,6 +234,7 @@ class Experiment:
         self.name: str = name
         self.description: Optional[str] = description
         self.steps: Dict[str, Step] = {} # Store steps by their ID for easy lookup
+        self.conditions: Dict[str, Condition] = {} # condition_id -> Condition
         # Maybe add overall experiment status, start/end times etc. later
 
     def add_step(self, step: Step):
@@ -214,11 +244,38 @@ class Experiment:
         self.steps[step.id] = step
         print(f"Step '{step.name}' added to experiment '{self.name}'.")
 
+    def add_condition(self, condition: Condition) -> None:
+        """Register a Condition on this experiment. Idempotent on Condition.id."""
+        self.conditions[condition.id] = condition
+
+    def ensure_default_condition(self) -> Condition:
+        """Return the default 'Main' Condition, creating it if absent.
+
+        Used by the U1 backfill path: experiments imported from pre-Condition
+        data get a single 'Main' Condition that owns all of their existing Steps.
+        Idempotent.
+        """
+        for c in self.conditions.values():
+            if c.name == "Main":
+                return c
+        main = Condition(
+            experiment_id=self.id,
+            name="Main",
+            color="slate",
+            order_index=0,
+        )
+        self.add_condition(main)
+        return main
+
     def get_step(self, step_id: str) -> Optional[Step]:
         return self.steps.get(step_id)
 
+    def steps_in_condition(self, condition_id: str) -> List[Step]:
+        """Return Steps whose condition_id matches, preserving insertion order."""
+        return [s for s in self.steps.values() if getattr(s, "condition_id", None) == condition_id]
+
     def __repr__(self):
-        return f"Experiment(id={self.id}, name='{self.name}', num_steps={len(self.steps)})"
+        return f"Experiment(id={self.id}, name='{self.name}', num_steps={len(self.steps)}, num_conditions={len(self.conditions)})"
 
 # Later, we'll add a Scheduler class to manage multiple Experiments and their Steps
 
@@ -310,6 +367,12 @@ class ExperimentORM(db.Model):
     shared_with = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
+    conditions = relationship(
+        "ConditionORM",
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        order_by="ConditionORM.order_index",
+    )
     steps = relationship(
         "StepORM",
         back_populates="experiment",
@@ -326,6 +389,11 @@ class ExperimentORM(db.Model):
             owner=getattr(experiment, "owner", None),
             shared_with=dict(getattr(experiment, "shared_with", {}) or {}),
         )
+        # Conditions must flush before Steps so the FK on Step.condition_id
+        # resolves. SQLAlchemy will order INSERTs based on relationship dependency
+        # graph; we just have to add Conditions to the session first.
+        for condition in experiment.conditions.values():
+            orm.conditions.append(ConditionORM.from_dataclass(condition))
         for step in experiment.steps.values():
             orm.steps.append(StepORM.from_dataclass(step, experiment_id=experiment.id))
         return orm
@@ -336,12 +404,72 @@ class ExperimentORM(db.Model):
         exp.name = self.name
         exp.description = self.description
         exp.steps = {}
+        exp.conditions = {}
         # owner / shared_with are extras the route handlers attach -- preserve them.
         exp.owner = self.owner
         exp.shared_with = dict(self.shared_with or {})
+        for cond_orm in self.conditions:
+            exp.conditions[cond_orm.id] = cond_orm.to_dataclass()
         for step_orm in self.steps:
             exp.steps[step_orm.id] = step_orm.to_dataclass()
         return exp
+
+
+class ConditionORM(db.Model):
+    __tablename__ = "conditions"
+
+    id = Column(String, primary_key=True)
+    experiment_id = Column(
+        String,
+        ForeignKey("experiments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String, nullable=False)
+    # ``color`` is a string key from the predefined palette (slate, coral, forest,
+    # lavender, amber, teal, magenta, mint, navy, gold). The frontend maps the
+    # key to an actual MUI palette value. Stored as a free string so adding new
+    # keys later doesn't require a schema change.
+    color = Column(String, nullable=False, default="slate")
+    order_index = Column(Integer, nullable=False, default=0)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    experiment = relationship("ExperimentORM", back_populates="conditions")
+    # Steps in this condition. Set up via StepORM.condition_id; cascade is on
+    # the Experiment side so we don't double-cascade.
+    steps = relationship(
+        "StepORM",
+        back_populates="condition",
+        order_by="StepORM.created_at",
+    )
+
+    @classmethod
+    def from_dataclass(cls, condition: "Condition") -> "ConditionORM":
+        return cls(
+            id=condition.id,
+            experiment_id=condition.experiment_id,
+            name=condition.name,
+            color=condition.color,
+            order_index=condition.order_index,
+            description=condition.description,
+        )
+
+    def to_dataclass(self) -> "Condition":
+        return Condition(
+            id=self.id,
+            experiment_id=self.experiment_id,
+            name=self.name,
+            color=self.color,
+            order_index=self.order_index,
+            description=self.description,
+        )
+
+    def apply_dataclass(self, condition: "Condition") -> None:
+        self.name = condition.name
+        self.color = condition.color
+        self.order_index = condition.order_index
+        self.description = condition.description
 
 
 class StepORM(db.Model):
@@ -349,6 +477,19 @@ class StepORM(db.Model):
 
     id = Column(String, primary_key=True)
     experiment_id = Column(String, ForeignKey("experiments.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Steps belong to exactly one Condition. nullable=True at the SQL level so
+    # SQLite ALTER TABLE ADD COLUMN works on legacy DBs that pre-date this
+    # plan; the backfill in db._run_migrations() populates condition_id for
+    # any pre-existing rows immediately after the column is added. Routes and
+    # the upsert path enforce non-null at the application layer (a Step
+    # whose dataclass has condition_id=None is rejected with a 400 before it
+    # reaches the ORM).
+    condition_id = Column(
+        String,
+        ForeignKey("conditions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     name = Column(String, nullable=False)
     duration_seconds = Column(Float, nullable=False, default=0.0)
     step_type = Column(String, nullable=False, default=StepType.FIXED_DURATION.value)
@@ -372,6 +513,7 @@ class StepORM(db.Model):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     experiment = relationship("ExperimentORM", back_populates="steps")
+    condition = relationship("ConditionORM", back_populates="steps")
 
     # Self-referential many-to-many over the association table. ``dependencies``
     # lists steps THIS step depends on (i.e. "parents" in DAG terms).
@@ -388,6 +530,7 @@ class StepORM(db.Model):
         return cls(
             id=step.id,
             experiment_id=experiment_id,
+            condition_id=step.condition_id,
             name=step.name,
             duration_seconds=step.duration.total_seconds() if step.duration else 0.0,
             step_type=step.step_type.value,
@@ -410,8 +553,11 @@ class StepORM(db.Model):
 
         Used by upsert paths to preserve in-flight RUNNING state across PUTs.
         Dependency relationships are NOT touched here -- callers manage those
-        via the association table.
+        via the association table. ``condition_id`` IS copied so that a
+        Designer-side condition reassignment persists.
         """
+        if step.condition_id:
+            self.condition_id = step.condition_id
         self.name = step.name
         self.duration_seconds = step.duration.total_seconds() if step.duration else 0.0
         self.step_type = step.step_type.value
@@ -431,6 +577,7 @@ class StepORM(db.Model):
     def to_dataclass(self) -> "Step":
         step = Step.__new__(Step)
         step.id = self.id
+        step.condition_id = self.condition_id
         step.name = self.name
         step.duration = timedelta(seconds=self.duration_seconds or 0.0)
         step.step_type = StepType(self.step_type)

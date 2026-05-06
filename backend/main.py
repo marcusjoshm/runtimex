@@ -32,7 +32,7 @@ from models import (
     TemplateORM,
     UserORM,
 )
-from scheduler import Scheduler
+from scheduler import Scheduler, ScheduleConflictError
 import auth
 from permissions import (
     can_view_experiment,
@@ -163,6 +163,25 @@ def _step_from_payload(step_data: dict) -> Step:
         dependencies=step_data.get('dependencies', []),
         notes=step_data.get('notes'),
         resource_needed=step_data.get('resource_required'),
+        condition_id=step_data.get('condition_id'),
+    )
+
+
+def _condition_from_payload(experiment_id: str, condition_data, default_order: int = 0):
+    """Build a Condition dataclass from the request body shape.
+
+    Honors a client-supplied ``id`` (so existing Conditions can round-trip on
+    PUT) and falls back to a fresh UUID. Defaults missing color/order_index
+    to safe values.
+    """
+    from models import Condition  # local import; main.py already imports models
+    return Condition(
+        experiment_id=experiment_id,
+        name=condition_data['name'],
+        color=condition_data.get('color', 'slate'),
+        order_index=int(condition_data.get('order_index', default_order)),
+        description=condition_data.get('description'),
+        id=condition_data.get('id'),
     )
 
 
@@ -182,11 +201,45 @@ def create_experiment():
     experiment.owner = username
     experiment.shared_with = {}  # username -> permission
 
+    # Conditions: accept from body if provided. If absent, auto-create a default
+    # "Main" Condition that owns all of this experiment's Steps. Same shape the
+    # backfill in db._run_migrations() produces, so legacy and fresh data look
+    # identical from the route handler's perspective.
+    incoming_conditions = data.get('conditions') or []
+    if incoming_conditions:
+        for idx, cond_data in enumerate(incoming_conditions):
+            experiment.add_condition(
+                _condition_from_payload(experiment.id, cond_data, default_order=idx)
+            )
+    else:
+        experiment.ensure_default_condition()
+
+    # Map a name-based fallback so old clients that POST steps without
+    # condition_id can still work: they all land in the default "Main"
+    # Condition. Only used if the client also didn't send a conditions array.
+    default_condition_id = next(iter(experiment.conditions.values())).id
+
     for step_data in data.get('steps', []):
         step = _step_from_payload(step_data)
+        # Honor client-supplied step id so dependencies resolve correctly.
+        # Without this, dependencies: ["step1"] would never match because the
+        # dataclass mints a fresh UUID and "step1" doesn't exist on the
+        # experiment.
+        if step_data.get('id'):
+            step.id = step_data['id']
+        if not step.condition_id:
+            step.condition_id = default_condition_id
+        if step.condition_id not in experiment.conditions:
+            return jsonify({
+                'error': f"Step references unknown condition_id '{step.condition_id}'"
+            }), 400
         experiment.add_step(step)
 
-    scheduler.add_experiment(experiment)
+    try:
+        scheduler.add_experiment(experiment)
+    except ScheduleConflictError as exc:
+        # Cross-condition dependency rejected by _sync_step_dependencies.
+        return jsonify({'error': str(exc)}), 400
 
     if experiment.steps:
         start_time = datetime.now()
@@ -222,7 +275,39 @@ def update_experiment(experiment_id):
     experiment.name = data.get('name', experiment.name)
     experiment.description = data.get('description', experiment.description)
 
+    # Conditions: when present, reconcile by ID. New conditions are added,
+    # existing ones get name/color/order_index/description updates, missing
+    # ones are removed (cascading removes steps assigned to them at the DB
+    # layer thanks to the upsert path that follows).
+    if 'conditions' in data:
+        incoming_conds = data['conditions'] or []
+        incoming_ids = {c.get('id') for c in incoming_conds if c.get('id')}
+        # Remove orphan Conditions not present in the incoming list.
+        for old_id in list(experiment.conditions.keys()):
+            if old_id not in incoming_ids:
+                experiment.conditions.pop(old_id, None)
+        # Apply edits + adds.
+        for idx, cond_data in enumerate(incoming_conds):
+            cond_id = cond_data.get('id')
+            if cond_id and cond_id in experiment.conditions:
+                target = experiment.conditions[cond_id]
+                target.name = cond_data.get('name', target.name)
+                target.color = cond_data.get('color', target.color)
+                target.order_index = int(cond_data.get('order_index', idx))
+                target.description = cond_data.get('description', target.description)
+            else:
+                experiment.add_condition(
+                    _condition_from_payload(experiment.id, cond_data, default_order=idx)
+                )
+
+    # Always ensure at least one Condition exists -- otherwise step.condition_id
+    # has no valid target. The default "Main" matches the backfill shape.
+    if not experiment.conditions:
+        experiment.ensure_default_condition()
+
     if 'steps' in data:
+        default_condition_id = next(iter(experiment.conditions.values())).id
+
         # Build a list of incoming Step objects. If the client sends an `id`
         # we honor it (used by existing-step edits); otherwise we mint a new
         # one (treated as a brand-new step).
@@ -231,14 +316,27 @@ def update_experiment(experiment_id):
             new_step = _step_from_payload(step_data)
             if step_data.get('id'):
                 new_step.id = step_data['id']
+            if not new_step.condition_id:
+                new_step.condition_id = default_condition_id
+            if new_step.condition_id not in experiment.conditions:
+                return jsonify({
+                    'error': f"Step references unknown condition_id '{new_step.condition_id}'"
+                }), 400
             incoming.append(new_step)
 
-        scheduler.upsert_experiment_steps(experiment, incoming)
+        try:
+            scheduler.upsert_experiment_steps(experiment, incoming)
+        except ScheduleConflictError as exc:
+            return jsonify({'error': str(exc)}), 400
 
         # Recalculate schedule for any newly-added (PENDING) steps. Existing
         # RUNNING/COMPLETED steps are skipped by calculate_initial_schedule.
         start_time = datetime.now()
         scheduler.calculate_initial_schedule(start_time=start_time)
+    else:
+        # Conditions changed but steps didn't -- still need to persist the
+        # condition mutations. Re-write the experiment row to flush them.
+        scheduler._persist_experiment(experiment)
 
     # Persist top-level field updates (name, description) too.
     exp_orm = db.session.get(ExperimentORM, experiment.id)

@@ -79,7 +79,19 @@ class Scheduler:
         self._hydrated = False
 
     def _persist_experiment(self, experiment: Experiment) -> None:
-        """Insert (or replace) an experiment + its steps."""
+        """Insert (or replace) an experiment + its steps.
+
+        Ensures the experiment has at least a default "Main" Condition before
+        flushing, so direct dataclass callers (tests, scripts) that don't set
+        ``experiment.conditions`` still produce well-formed rows. Routes
+        already do this at the request boundary; this is the safety net.
+        """
+        if not experiment.conditions:
+            main = experiment.ensure_default_condition()
+            for s in experiment.steps.values():
+                if not getattr(s, "condition_id", None):
+                    s.condition_id = main.id
+
         existing = db.session.get(ExperimentORM, experiment.id)
         if existing is not None:
             db.session.delete(existing)
@@ -92,12 +104,31 @@ class Scheduler:
         db.session.commit()
 
     def _sync_step_dependencies(self, experiment: Experiment, orm: ExperimentORM) -> None:
-        """Sync StepORM.dependencies association rows from the dataclass shape."""
+        """Sync StepORM.dependencies association rows from the dataclass shape.
+
+        Rejects cross-condition dependencies: a Step in Condition A cannot depend
+        on a Step in Condition B. Raises ScheduleConflictError with the offending
+        step IDs so route handlers can return a 400 to the client.
+        """
         steps_by_id = {s.id: s for s in orm.steps}
         for dc_step in experiment.steps.values():
             target = steps_by_id.get(dc_step.id)
             if target is None:
                 continue
+            for d_id in dc_step.dependencies:
+                dep = steps_by_id.get(d_id)
+                if dep is None:
+                    continue
+                if (
+                    target.condition_id
+                    and dep.condition_id
+                    and target.condition_id != dep.condition_id
+                ):
+                    raise ScheduleConflictError(
+                        f"Cross-condition dependency rejected: step {target.id} "
+                        f"(condition {target.condition_id}) cannot depend on step "
+                        f"{dep.id} (condition {dep.condition_id})"
+                    )
             target.dependencies = [
                 steps_by_id[d_id] for d_id in dc_step.dependencies if d_id in steps_by_id
             ]
@@ -162,6 +193,11 @@ class Scheduler:
                 target.dependencies = list(inc.dependencies)
                 target.notes = inc.notes
                 target.resource_needed = inc.resource_needed
+                # ``condition_id`` IS editable so the Designer can move a Step
+                # between Conditions. The dep cross-condition check below
+                # rejects the move if the resulting graph violates R1.
+                if inc.condition_id:
+                    target.condition_id = inc.condition_id
                 # Re-derive scheduled_end_time if a scheduled_start exists.
                 if target.scheduled_start_time:
                     target.scheduled_end_time = target.scheduled_start_time + target.duration
