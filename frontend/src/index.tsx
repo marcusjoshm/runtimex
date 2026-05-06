@@ -4,6 +4,12 @@ import './index.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
 import * as serviceWorkerRegistration from './serviceWorkerRegistration';
+import { bootstrapAuth } from './api/auth';
+
+// Restore the axios Authorization header from localStorage BEFORE any
+// component mounts so the first authenticated fetch (e.g. Home's
+// getUserExperiments) carries the JWT and doesn't race a 401.
+bootstrapAuth();
 
 const root = ReactDOM.createRoot(
   document.getElementById('root') as HTMLElement

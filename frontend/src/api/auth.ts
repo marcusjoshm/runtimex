@@ -14,6 +14,21 @@ export interface AuthResponse {
   token: string;
 }
 
+/**
+ * Restore the axios Authorization header from localStorage synchronously.
+ * Call this once at app boot, before any component mounts and fires its
+ * first authenticated request. If no token is present, any stale header is
+ * cleared so we don't accidentally send an old token after logout.
+ */
+export const bootstrapAuth = (): void => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+  } else {
+    delete axios.defaults.headers.common['Authorization'];
+  }
+};
+
 // Create auth client
 const authClient = {
   register: async (username: string, email: string, password: string): Promise<AuthResponse> => {

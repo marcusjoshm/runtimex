@@ -74,8 +74,38 @@ const apiClient = {
 
   // Export experiment
   exportExperiment: async (experimentId: string): Promise<void> => {
-    // This will trigger a file download
-    window.location.href = `${API_URL}/experiments/${experimentId}/export`;
+    // The backend's export route is now @jwt_required (U3), so we must send
+    // the Authorization header — `window.location.href` won't. Pull the
+    // payload as a Blob via axios (which carries the default Authorization
+    // header set by bootstrapAuth/login) and trigger the download from a
+    // temporary anchor element.
+    const response = await axios.get(
+      `${API_URL}/experiments/${experimentId}/export`,
+      { responseType: 'blob' }
+    );
+
+    const blob = new Blob([response.data], {
+      type: response.headers['content-type'] || 'application/json',
+    });
+    const objectUrl = URL.createObjectURL(blob);
+
+    // Try to honor Content-Disposition's filename, fall back to a sensible default.
+    let filename = `experiment-${experimentId}.json`;
+    const disposition = response.headers['content-disposition'];
+    if (typeof disposition === 'string') {
+      const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+      if (match && match[1]) {
+        filename = decodeURIComponent(match[1]);
+      }
+    }
+
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(objectUrl);
   },
 
   // Import experiment

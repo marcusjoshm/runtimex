@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
+  Alert,
   Box,
   Button,
+  CircularProgress,
   Container,
   TextField,
   Typography,
@@ -30,6 +32,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import SaveIcon from '@mui/icons-material/Save';
+import apiClient, { Experiment as ApiExperiment, Step as ApiStep } from '../api/client';
 
 interface Step {
   id: string;
@@ -48,13 +51,15 @@ interface Experiment {
   steps: Step[];
 }
 
+const newLocalId = () => Math.random().toString(36).substring(2, 9);
+
 const ExperimentDesigner: React.FC = () => {
-  const location = useLocation();
   const navigate = useNavigate();
-  const experimentId = new URLSearchParams(location.search).get('id');
-  
+  const { id: experimentId } = useParams<{ id?: string }>();
+  const isEditing = Boolean(experimentId);
+
   const [experiment, setExperiment] = useState<Experiment>({
-    id: experimentId || Math.random().toString(36).substring(2, 9),
+    id: experimentId || newLocalId(),
     name: '',
     description: '',
     steps: []
@@ -64,37 +69,51 @@ const ExperimentDesigner: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<Step | null>(null);
   const [editStepIndex, setEditStepIndex] = useState<number | null>(null);
 
+  const [loading, setLoading] = useState<boolean>(isEditing);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState<boolean>(false);
+
   // Load experiment data if editing an existing one
   useEffect(() => {
-    if (experimentId) {
-      // This would be an API call in a real app
-      // Mock data for now
-      if (experimentId === '1') {
-        setExperiment({
-          id: '1',
-          name: 'Cell Culture Protocol',
-          description: 'Standard protocol for maintaining cell cultures',
-          steps: [
-            {
-              id: 's1',
-              name: 'Prepare media',
-              type: 'task',
-              duration: 15,
-              dependencies: [],
-              resourceNeeded: 'lab_bench'
-            },
-            {
-              id: 's2',
-              name: 'Thaw cells',
-              type: 'fixed_duration',
-              duration: 30,
-              dependencies: ['s1'],
-              resourceNeeded: 'water_bath'
-            }
-          ]
-        });
-      }
+    let cancelled = false;
+    if (!experimentId) {
+      setLoading(false);
+      return;
     }
+
+    setLoading(true);
+    setLoadError(null);
+
+    apiClient.getExperiment(experimentId)
+      .then((data: ApiExperiment) => {
+        if (cancelled) return;
+        setExperiment({
+          id: data.id,
+          name: data.name || '',
+          description: data.description || '',
+          steps: (data.steps || []).map((s: ApiStep) => ({
+            id: s.id,
+            name: s.name,
+            type: s.type,
+            duration: s.duration,
+            dependencies: s.dependencies || [],
+            notes: s.notes,
+            resourceNeeded: s.resourceNeeded,
+          })),
+        });
+      })
+      .catch((err: any) => {
+        if (cancelled) return;
+        setLoadError(err.response?.data?.error || 'Failed to load experiment');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [experimentId]);
 
   const handleAddStep = () => {
@@ -171,12 +190,74 @@ const ExperimentDesigner: React.FC = () => {
     setCurrentStep({...currentStep, type: e.target.value});
   };
 
-  const handleSaveExperiment = () => {
-    // This would be an API call in a real app
-    console.log('Saving experiment:', experiment);
-    alert('Experiment saved successfully!');
-    navigate('/');
+  const handleSaveExperiment = async () => {
+    setSaveError(null);
+
+    // Belt-and-suspenders validation: inputProps={{min: 1}} on the duration
+    // field is bypassable via paste/keyboard. Re-check here.
+    const invalidStep = experiment.steps.find(
+      (s) => !Number.isFinite(s.duration) || s.duration <= 0
+    );
+    if (invalidStep) {
+      setSaveError(
+        `Step "${invalidStep.name || 'unnamed'}" must have a duration greater than zero.`
+      );
+      return;
+    }
+
+    // Map to the backend's expected shape. Field names stay camelCase for now;
+    // U8 will normalize the wire format to snake_case in a single mechanical pass.
+    const payload = {
+      name: experiment.name,
+      description: experiment.description,
+      steps: experiment.steps.map((s) => ({
+        id: s.id,
+        name: s.name,
+        type: s.type,
+        duration: s.duration,
+        dependencies: s.dependencies,
+        notes: s.notes,
+        resourceNeeded: s.resourceNeeded,
+      })),
+    };
+
+    try {
+      setSaving(true);
+      if (experimentId) {
+        await apiClient.updateExperiment(experimentId, payload as Partial<ApiExperiment>);
+      } else {
+        await apiClient.createExperiment(payload as Omit<ApiExperiment, 'id'>);
+      }
+      navigate('/');
+    } catch (err: any) {
+      setSaveError(err.response?.data?.error || 'Save failed');
+    } finally {
+      setSaving(false);
+    }
   };
+
+  if (loading) {
+    return (
+      <Container maxWidth="lg">
+        <Box sx={{ my: 4, display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 200 }}>
+          <CircularProgress />
+        </Box>
+      </Container>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <Container maxWidth="lg">
+        <Box sx={{ my: 4 }}>
+          <Alert severity="error">{loadError}</Alert>
+          <Box sx={{ mt: 2 }}>
+            <Button onClick={() => navigate('/')}>Back to Home</Button>
+          </Box>
+        </Box>
+      </Container>
+    );
+  }
 
   return (
     <Container maxWidth="lg">
@@ -184,7 +265,13 @@ const ExperimentDesigner: React.FC = () => {
         <Typography variant="h4" component="h1" gutterBottom>
           {experimentId ? 'Edit Experiment' : 'Create New Experiment'}
         </Typography>
-        
+
+        {saveError && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {saveError}
+          </Alert>
+        )}
+
         <Paper sx={{ p: 3, mb: 4 }}>
           <Grid container spacing={3}>
             <Grid item xs={12}>
@@ -296,14 +383,14 @@ const ExperimentDesigner: React.FC = () => {
         )}
         
         <Box sx={{ mt: 4, display: 'flex', justifyContent: 'flex-end' }}>
-          <Button 
-            variant="contained" 
-            color="primary" 
+          <Button
+            variant="contained"
+            color="primary"
             startIcon={<SaveIcon />}
             onClick={handleSaveExperiment}
-            disabled={!experiment.name || experiment.steps.length === 0}
+            disabled={!experiment.name || experiment.steps.length === 0 || saving}
           >
-            Save Experiment
+            {saving ? 'Saving...' : 'Save Experiment'}
           </Button>
         </Box>
       </Box>
