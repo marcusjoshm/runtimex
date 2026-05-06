@@ -146,17 +146,17 @@ def test_conflicts_api_round_trip(client, auth_headers):
         "steps": [
             {
                 "name": "A",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
             {
                 "name": "B",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
         ],
     }
@@ -195,7 +195,7 @@ def test_conflicts_route_unrelated_user_gets_404(client, auth_headers, second_us
         "name": "PrivateConflictExp",
         "description": "",
         "steps": [
-            {"name": "A", "type": "fixed_duration", "duration": 5, "dependencies": [], "resourceNeeded": "x"},
+            {"name": "A", "step_type": "fixed_duration", "duration_seconds": 300, "dependencies": [], "resource_required": "x"},
         ],
     }
     r = client.post("/api/experiments", headers=auth_headers, json=payload)
@@ -215,7 +215,7 @@ def test_update_experiment_response_includes_conflicts(client, auth_headers):
         "name": "DesignerConflict",
         "description": "",
         "steps": [
-            {"name": "A", "type": "fixed_duration", "duration": 60, "dependencies": [], "resourceNeeded": "microscope"},
+            {"name": "A", "step_type": "fixed_duration", "duration_seconds": 3600, "dependencies": [], "resource_required": "microscope"},
         ],
     }
     r = client.post("/api/experiments", headers=auth_headers, json=create_payload)
@@ -232,17 +232,17 @@ def test_update_experiment_response_includes_conflicts(client, auth_headers):
             {
                 "id": created["steps"][0]["id"],
                 "name": created["steps"][0]["name"],
-                "type": created["steps"][0]["type"],
-                "duration": created["steps"][0]["duration"],
+                "step_type": created["steps"][0]["step_type"],
+                "duration_seconds": created["steps"][0]["duration_seconds"],
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
             {
                 "name": "B",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
         ],
     }

@@ -24,8 +24,8 @@ def _create_experiment(client, headers, name="ExpA", with_steps=True):
     }
     if with_steps:
         payload["steps"] = [
-            {"name": "S1", "duration": 5, "type": "task", "dependencies": []},
-            {"name": "S2", "duration": 7, "type": "task", "dependencies": []},
+            {"name": "S1", "duration_seconds": 300, "step_type": "task", "dependencies": []},
+            {"name": "S2", "duration_seconds": 420, "step_type": "task", "dependencies": []},
         ]
     r = client.post("/api/experiments", headers=headers, json=payload)
     assert r.status_code == 201, r.get_json()
@@ -71,8 +71,8 @@ def test_owner_can_get_put_and_run_step(client, auth_headers):
             "name": "OwnerExp Renamed",
             "description": "edited",
             "steps": [
-                {"id": step_id, "name": "S1 Renamed", "duration": 5, "type": "task"},
-                {"id": exp["steps"][1]["id"], "name": "S2", "duration": 7, "type": "task"},
+                {"id": step_id, "name": "S1 Renamed", "duration_seconds": 300, "step_type": "task"},
+                {"id": exp["steps"][1]["id"], "name": "S2", "duration_seconds": 420, "step_type": "task"},
             ],
         },
     )
@@ -133,7 +133,7 @@ def test_edit_share_allows_get_and_put(client, auth_headers, second_user_headers
             "name": "Edited By Bob",
             "description": "bob was here",
             "steps": [
-                {"id": s["id"], "name": s["name"], "duration": 5, "type": "task"}
+                {"id": s["id"], "name": s["name"], "duration_seconds": 300, "step_type": "task"}
                 for s in exp["steps"]
             ],
         },

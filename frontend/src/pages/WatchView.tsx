@@ -75,8 +75,8 @@ const WatchView: React.FC = () => {
     }
     
     // Calculate initial elapsed time if step is already running
-    if (activeStep.actualStartTime) {
-      const startTime = new Date(activeStep.actualStartTime).getTime();
+    if (activeStep.actual_start_time) {
+      const startTime = new Date(activeStep.actual_start_time).getTime();
       const now = new Date().getTime();
       setElapsedSeconds(Math.floor((now - startTime) / 1000));
     }

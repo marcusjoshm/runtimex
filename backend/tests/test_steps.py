@@ -25,8 +25,8 @@ def _create_experiment(client, headers, name="StepsExp"):
         "name": name,
         "description": "test",
         "steps": [
-            {"name": "S1", "duration": 5, "type": "task", "dependencies": []},
-            {"name": "S2", "duration": 7, "type": "task", "dependencies": []},
+            {"name": "S1", "duration_seconds": 300, "step_type": "task", "dependencies": []},
+            {"name": "S2", "duration_seconds": 420, "step_type": "task", "dependencies": []},
         ],
     }
     r = client.post("/api/experiments", headers=headers, json=payload)
@@ -163,3 +163,43 @@ def test_step_first_start_time_set_on_first_start_only():
     assert step.actual_start_time == later
     # ...but first_start_time is preserved.
     assert step.first_start_time == first_start
+
+
+# ---------------------------------------------------------------------------
+# 6. U8 regression: sub-minute durations round-trip without truncation.
+# ---------------------------------------------------------------------------
+def test_duration_seconds_round_trip_under_60_seconds(client, auth_headers):
+    """A step with ``duration_seconds=30`` must NOT come back as ``0``.
+
+    The pre-U8 serializer floor-divided ``total_seconds()`` by 60 to
+    "convert to minutes", which silently truncated any sub-minute step to
+    zero. U8 emits ``duration_seconds`` directly as a float.
+
+    This is the regression test: create -> fetch -> assert the value is 30.0.
+    """
+    payload = {
+        "name": "ShortStepExp",
+        "description": "30-second step shouldn't round to 0",
+        "steps": [
+            {
+                "name": "BlinkStep",
+                "step_type": "fixed_duration",
+                "duration_seconds": 30,
+                "dependencies": [],
+            }
+        ],
+    }
+    r = client.post("/api/experiments", headers=auth_headers, json=payload)
+    assert r.status_code == 201, r.get_json()
+    exp_id = r.get_json()["id"]
+
+    r = client.get(f"/api/experiments/{exp_id}", headers=auth_headers)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert len(body["steps"]) == 1
+    blink = body["steps"][0]
+    # Float comparison is exact here: 30 -> timedelta(seconds=30).total_seconds() == 30.0.
+    assert blink["duration_seconds"] == 30.0, (
+        f"sub-minute step truncated to {blink['duration_seconds']} "
+        f"(would be the // 60 bug)"
+    )

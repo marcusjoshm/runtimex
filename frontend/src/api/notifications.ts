@@ -1,8 +1,7 @@
 import axios from 'axios';
-import { io, Socket } from 'socket.io-client';
 import authClient from './auth';
-
-const API_URL = 'http://localhost:5001/api';
+import socketService from './socket';
+import { API_BASE } from './config';
 
 // Notification types
 export enum NotificationType {
@@ -63,58 +62,61 @@ export interface Notification {
 // Notification handlers type
 export type NotificationHandler = (notification: Notification) => void;
 
+/**
+ * NotificationService -- thin REST + event-listener wrapper around the
+ * shared socket from socket.ts. U8 consolidated what used to be a SECOND
+ * socket.io connection here into a subscription on the shared instance, so
+ * each browser tab now opens exactly one socket per session.
+ */
 class NotificationService {
-  private socket: Socket | null = null;
   private handlers: Map<string, NotificationHandler> = new Map();
   private notificationListeners: ((notifications: Notification[]) => void)[] = [];
   private notifications: Notification[] = [];
+  private unsubscribeSocket: (() => void) | null = null;
 
   constructor() {
-    // Initialize socket if user is logged in
+    // Initialize shared-socket subscription if user is logged in
     this.initSocket();
 
-    // Listen for auth changes
+    // Listen for auth changes (login/logout) so we re-fetch on auth flip.
     document.addEventListener('authChanged', this.initSocket);
   }
 
   private initSocket = async () => {
     const user = await authClient.getCurrentUser();
-    
+
     if (user) {
-      // Get JWT token
-      const token = localStorage.getItem('token');
-      
-      // Close existing socket if it exists
-      if (this.socket) {
-        this.socket.disconnect();
+      // Reuse the shared socket. socketService.initializeSocket is idempotent
+      // (early-returns if already connected) so calling it here is safe and
+      // ensures the connection exists before we subscribe.
+      socketService.initializeSocket();
+
+      // Tear down any prior subscription so we don't double-handle on auth flip.
+      if (this.unsubscribeSocket) {
+        this.unsubscribeSocket();
+        this.unsubscribeSocket = null;
       }
-      
-      // Create new socket connection with auth token
-      this.socket = io('http://localhost:5001', {
-        query: { token }
-      });
-      
-      // Set up event handlers
-      this.socket.on('connect', () => {
-        console.log('Connected to notification service');
-        this.fetchNotifications(); // Get initial notifications
-      });
-      
-      this.socket.on('notification', (notification: Notification) => {
-        console.log('Received notification:', notification);
-        this.notifications.unshift(notification); // Add to start of array
+
+      this.unsubscribeSocket = socketService.onNotification((notification: Notification) => {
+        // Add to start of array via mapped-array pattern (see markAsRead/dismissNotification
+        // for full context on why mutation-in-place is forbidden).
+        this.notifications = [notification, ...this.notifications];
+
         this.notifyListeners();
-        
+
         // Call the specific handler if registered
         const handler = this.handlers.get(notification.type);
         if (handler) {
           handler(notification);
         }
       });
-    } else if (this.socket) {
-      // Disconnect if user logged out
-      this.socket.disconnect();
-      this.socket = null;
+
+      // Initial fetch.
+      this.fetchNotifications();
+    } else if (this.unsubscribeSocket) {
+      // User logged out: unsubscribe so a stale handler doesn't leak.
+      this.unsubscribeSocket();
+      this.unsubscribeSocket = null;
     }
   };
 
@@ -154,7 +156,7 @@ class NotificationService {
   // Fetch notifications from the server
   public async fetchNotifications(unreadOnly = false) {
     try {
-      const response = await axios.get(`${API_URL}/notifications${unreadOnly ? '?unread_only=true' : ''}`);
+      const response = await axios.get(`${API_BASE}/notifications${unreadOnly ? '?unread_only=true' : ''}`);
       this.notifications = response.data;
       this.notifyListeners();
       return this.notifications;
@@ -175,7 +177,7 @@ class NotificationService {
   // preserve this mapped-array shape; do not regress to mutate-in-place.
   public async markAsRead(notificationId: string) {
     try {
-      await axios.post(`${API_URL}/notifications/${notificationId}/read`);
+      await axios.post(`${API_BASE}/notifications/${notificationId}/read`);
 
       // Update local state with a NEW array + NEW object for the changed entry.
       this.notifications = Array.isArray(this.notifications)
@@ -195,7 +197,7 @@ class NotificationService {
   // that comment for context. NOTE FOR U8: keep the mapped-array pattern.
   public async dismissNotification(notificationId: string) {
     try {
-      await axios.post(`${API_URL}/notifications/${notificationId}/dismiss`);
+      await axios.post(`${API_BASE}/notifications/${notificationId}/dismiss`);
 
       // Update local state with a NEW array + NEW object for the changed entry.
       this.notifications = Array.isArray(this.notifications)
@@ -212,8 +214,8 @@ class NotificationService {
   // Delete a notification
   public async deleteNotification(notificationId: string) {
     try {
-      await axios.delete(`${API_URL}/notifications/${notificationId}`);
-      
+      await axios.delete(`${API_BASE}/notifications/${notificationId}`);
+
       // Update local state
       const index = this.notifications.findIndex(n => n.id === notificationId);
       if (index !== -1) {
@@ -234,7 +236,7 @@ class NotificationService {
           window.location.href = action.data.link;
         }
         break;
-      
+
       case ActionType.BUTTON:
         // Handle different button actions
         if (action.id === 'start_step' && action.data?.step_id) {
@@ -271,14 +273,14 @@ class NotificationService {
           }
         }
         break;
-        
+
       case ActionType.DISMISS:
         // Just dismiss the notification
         this.dismissNotification(notification.id);
         break;
-        
+
       // Additional action types can be handled here
-        
+
       default:
         console.warn(`Unhandled action type: ${action.type}`);
     }
@@ -287,4 +289,4 @@ class NotificationService {
 
 // Create singleton instance
 const notificationService = new NotificationService();
-export default notificationService; 
+export default notificationService;

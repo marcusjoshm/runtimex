@@ -159,7 +159,8 @@ const ExperimentRunner: React.FC = () => {
         if (process.env.NODE_ENV === 'development' && experimentId === '1') {
           const now = new Date();
           
-          // Create sample experiment with steps
+          // Create sample experiment with steps. Wire format is snake_case +
+          // duration in seconds (U8); the mock matches the real shape.
           const mockExperiment: Experiment = {
             id: '1',
             name: 'Cell Culture Protocol',
@@ -168,46 +169,46 @@ const ExperimentRunner: React.FC = () => {
               {
                 id: 's1',
                 name: 'Prepare media',
-                type: StepType.TASK,
-                duration: 15,
+                step_type: StepType.TASK,
+                duration_seconds: 15 * 60,
                 status: StepStatus.READY,
                 dependencies: [],
-                resourceNeeded: 'lab_bench',
-                scheduledStartTime: now.toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 15 * 60 * 1000).toISOString()
+                resource_required: 'lab_bench',
+                scheduled_start_time: now.toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 15 * 60 * 1000).toISOString()
               },
               {
                 id: 's2',
                 name: 'Thaw cells',
-                type: StepType.FIXED_DURATION,
-                duration: 30,
+                step_type: StepType.FIXED_DURATION,
+                duration_seconds: 30 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s1'],
-                resourceNeeded: 'water_bath',
-                scheduledStartTime: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 45 * 60 * 1000).toISOString()
+                resource_required: 'water_bath',
+                scheduled_start_time: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 45 * 60 * 1000).toISOString()
               },
               {
                 id: 's3',
                 name: 'Centrifuge cells',
-                type: StepType.FIXED_DURATION,
-                duration: 5,
+                step_type: StepType.FIXED_DURATION,
+                duration_seconds: 5 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s2'],
-                resourceNeeded: 'centrifuge',
-                scheduledStartTime: new Date(now.getTime() + 45 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 50 * 60 * 1000).toISOString()
+                resource_required: 'centrifuge',
+                scheduled_start_time: new Date(now.getTime() + 45 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 50 * 60 * 1000).toISOString()
               },
               {
                 id: 's4',
                 name: 'Plate cells',
-                type: StepType.TASK,
-                duration: 20,
+                step_type: StepType.TASK,
+                duration_seconds: 20 * 60,
                 status: StepStatus.PENDING,
                 dependencies: ['s3'],
-                resourceNeeded: 'hood',
-                scheduledStartTime: new Date(now.getTime() + 50 * 60 * 1000).toISOString(),
-                scheduledEndTime: new Date(now.getTime() + 70 * 60 * 1000).toISOString()
+                resource_required: 'hood',
+                scheduled_start_time: new Date(now.getTime() + 50 * 60 * 1000).toISOString(),
+                scheduled_end_time: new Date(now.getTime() + 70 * 60 * 1000).toISOString()
               }
             ]
           };
@@ -275,16 +276,17 @@ const ExperimentRunner: React.FC = () => {
       if (!current) return;
 
       // Auto-complete fixed-duration steps whose elapsed seconds have hit
-      // their budget. We compute elapsed from actualStartTime each tick so
-      // we don't rely on the server for sub-second polling.
+      // their budget. We compute elapsed from actual_start_time each tick so
+      // we don't rely on the server for sub-second polling. duration_seconds
+      // is already in seconds (U8) so the comparison is direct -- no `* 60`.
       current.steps.forEach((step) => {
         if (
           step.status === StepStatus.RUNNING &&
-          step.type === StepType.FIXED_DURATION &&
-          step.actualStartTime
+          step.step_type === StepType.FIXED_DURATION &&
+          step.actual_start_time
         ) {
-          const elapsed = differenceInSeconds(new Date(), parseISO(step.actualStartTime));
-          if (elapsed >= step.duration * 60) {
+          const elapsed = differenceInSeconds(new Date(), parseISO(step.actual_start_time));
+          if (elapsed >= step.duration_seconds) {
             handleStepCompleteRef.current(step.id);
           }
         }
@@ -402,14 +404,25 @@ const ExperimentRunner: React.FC = () => {
 
   const formatTime = (seconds?: number) => {
     if (seconds === undefined) return '--:--';
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const safe = Math.max(0, Math.floor(seconds));
+    const mins = Math.floor(safe / 60);
+    const secs = safe % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Convert duration_seconds -> human-readable minutes for the static labels.
+  // Sub-minute durations show "<1 min" so a 30-second step doesn't render as
+  // "0 min" (the audit's // 60 truncation bug, surfaced visually).
+  const formatDurationMinutes = (seconds: number): string => {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '0 min';
+    if (seconds < 60) return '<1 min';
+    return `${Math.floor(seconds / 60)} min`;
+  };
+
   const getProgress = (step: Step) => {
-    if (!step.elapsedTime || step.type === StepType.TASK) return 0;
-    const progress = (step.elapsedTime / (step.duration * 60)) * 100;
+    if (!step.elapsed_seconds || step.step_type === StepType.TASK) return 0;
+    if (!step.duration_seconds || step.duration_seconds <= 0) return 0;
+    const progress = (step.elapsed_seconds / step.duration_seconds) * 100;
     return Math.min(progress, 100);
   };
 
@@ -531,14 +544,14 @@ const ExperimentRunner: React.FC = () => {
                 <Grid container spacing={2}>
                   <Grid item xs={12} md={6}>
                     <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Type: {activeStep.type.replace('_', ' ')}
+                      Type: {activeStep.step_type.replace('_', ' ')}
                     </Typography>
                     <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Duration: {activeStep.duration} minutes
+                      Duration: {formatDurationMinutes(activeStep.duration_seconds)}
                     </Typography>
-                    {activeStep.resourceNeeded && (
+                    {activeStep.resource_required && (
                       <Typography variant="body2" color="text.secondary" gutterBottom>
-                        Resource: {activeStep.resourceNeeded}
+                        Resource: {activeStep.resource_required}
                       </Typography>
                     )}
                     {activeStep.notes && (
@@ -553,14 +566,14 @@ const ExperimentRunner: React.FC = () => {
                         <Box sx={{ display: 'flex', alignItems: 'center' }}>
                           <TimerIcon sx={{ mr: 1 }} />
                           <Typography variant="h6">
-                            {formatTime(activeStep.elapsedTime)}
+                            {formatTime(activeStep.elapsed_seconds)}
                           </Typography>
                         </Box>
-                        
-                        {activeStep.type !== StepType.TASK && (
-                          <LinearProgress 
-                            variant="determinate" 
-                            value={getProgress(activeStep)} 
+
+                        {activeStep.step_type !== StepType.TASK && (
+                          <LinearProgress
+                            variant="determinate"
+                            value={getProgress(activeStep)}
                             sx={{ height: 10, mt: 1 }}
                           />
                         )}
@@ -583,7 +596,7 @@ const ExperimentRunner: React.FC = () => {
                 
                 {activeStep.status === StepStatus.RUNNING && (
                   <>
-                    {activeStep.type === StepType.TASK && (
+                    {activeStep.step_type === StepType.TASK && (
                       <Button 
                         color="warning" 
                         variant="contained"
@@ -672,7 +685,7 @@ const ExperimentRunner: React.FC = () => {
                     <Box>
                       {step.status === StepStatus.RUNNING && (
                         <Typography variant="body2" color="text.secondary" sx={{ mr: 2 }}>
-                          {formatTime(step.elapsedTime)}
+                          {formatTime(step.elapsed_seconds)}
                         </Typography>
                       )}
                       {getStepStatusChip(step.status)}
@@ -683,7 +696,7 @@ const ExperimentRunner: React.FC = () => {
                 >
                   <ListItemText
                     primary={`${index + 1}. ${step.name}`}
-                    secondary={`Type: ${step.type.replace('_', ' ')} | Duration: ${step.duration} min | Resource: ${step.resourceNeeded || 'none'}`}
+                    secondary={`Type: ${step.step_type.replace('_', ' ')} | Duration: ${formatDurationMinutes(step.duration_seconds)} | Resource: ${step.resource_required || 'none'}`}
                   />
                 </ListItem>
               </React.Fragment>
@@ -703,17 +716,17 @@ const ExperimentRunner: React.FC = () => {
             <>
               <Typography variant="h6" gutterBottom>{selectedStep.name}</Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Type:</strong> {selectedStep.type.replace('_', ' ')}
+                <strong>Type:</strong> {selectedStep.step_type.replace('_', ' ')}
               </Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Duration:</strong> {selectedStep.duration} minutes
+                <strong>Duration:</strong> {formatDurationMinutes(selectedStep.duration_seconds)}
               </Typography>
               <Typography variant="body2" gutterBottom>
                 <strong>Status:</strong> {selectedStep.status}
               </Typography>
-              {selectedStep.resourceNeeded && (
+              {selectedStep.resource_required && (
                 <Typography variant="body2" gutterBottom>
-                  <strong>Resource Needed:</strong> {selectedStep.resourceNeeded}
+                  <strong>Resource Needed:</strong> {selectedStep.resource_required}
                 </Typography>
               )}
               {selectedStep.dependencies.length > 0 && (
@@ -730,14 +743,14 @@ const ExperimentRunner: React.FC = () => {
                 </Typography>
               )}
               <Typography variant="body2" gutterBottom>
-                <strong>Scheduled Start:</strong> {formatDateTime(selectedStep.scheduledStartTime)}
+                <strong>Scheduled Start:</strong> {formatDateTime(selectedStep.scheduled_start_time)}
               </Typography>
               <Typography variant="body2" gutterBottom>
-                <strong>Actual Start:</strong> {formatDateTime(selectedStep.actualStartTime)}
+                <strong>Actual Start:</strong> {formatDateTime(selectedStep.actual_start_time)}
               </Typography>
-              {selectedStep.actualEndTime && (
+              {selectedStep.actual_end_time && (
                 <Typography variant="body2" gutterBottom>
-                  <strong>Actual End:</strong> {formatDateTime(selectedStep.actualEndTime)}
+                  <strong>Actual End:</strong> {formatDateTime(selectedStep.actual_end_time)}
                 </Typography>
               )}
             </>

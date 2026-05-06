@@ -39,6 +39,7 @@ from permissions import (
     can_edit_experiment,
     can_run_step,
 )
+from serializers import experiment_to_dict, step_to_dict, template_steps_payload
 
 # Import notification system
 from notifications import NotificationService, Notification, NotificationType, NotificationPriority, ActionType, NotificationAction, create_notification_factories
@@ -103,57 +104,6 @@ def print_schedule(scheduler: Scheduler):
         )
     print("------------------------\n")
 
-# Helper function to convert experiment object to JSON-serializable dict
-def experiment_to_dict(experiment):
-    steps = []
-    for step_id, step in experiment.steps.items():
-        step_dict = {
-            'id': step.id,
-            'name': step.name,
-            'type': step.step_type.value,
-            'duration': step.duration.total_seconds() // 60,  # Convert to minutes
-            'status': step.status.value,
-            'dependencies': step.dependencies,
-            'notes': step.notes,
-            'resourceNeeded': step.resource_needed,
-        }
-        
-        # Add timing information
-        if step.scheduled_start_time:
-            step_dict['scheduledStartTime'] = step.scheduled_start_time.isoformat()
-        if step.scheduled_end_time:
-            step_dict['scheduledEndTime'] = step.scheduled_end_time.isoformat()
-        if step.actual_start_time:
-            step_dict['actualStartTime'] = step.actual_start_time.isoformat()
-        # ``first_start_time`` survives pause/resume cycles. Reports rely on it
-        # to answer "when did this step originally begin?" since
-        # ``actual_start_time`` is overwritten on every resume. Serialized as
-        # camelCase to match the rest of the experiment payload (U8 normalizes
-        # the whole wire format to snake_case).
-        first_start_time = getattr(step, 'first_start_time', None)
-        if first_start_time:
-            step_dict['firstStartTime'] = first_start_time.isoformat()
-        if step.actual_end_time:
-            step_dict['actualEndTime'] = step.actual_end_time.isoformat()
-        if step.elapsed_time:
-            step_dict['elapsedTime'] = step.elapsed_time.total_seconds()
-            
-        steps.append(step_dict)
-        
-    result = {
-        'id': experiment.id,
-        'name': experiment.name,
-        'description': experiment.description,
-        'steps': steps
-    }
-    
-    # Add ownership information if available
-    if hasattr(experiment, 'owner'):
-        result['owner'] = experiment.owner
-        result['sharedWith'] = experiment.shared_with
-    
-    return result
-
 # --- API Routes ---
 
 @app.route('/api/experiments', methods=['GET'])
@@ -193,34 +143,49 @@ def get_experiment(experiment_id):
 
     return jsonify(experiment_to_dict(experiment))
 
+def _step_from_payload(step_data: dict) -> Step:
+    """Build a ``Step`` from an incoming JSON payload.
+
+    Reads the snake_case wire format normalized in U8:
+      * ``duration_seconds`` (float seconds) -- previously ``duration`` (int minutes).
+      * ``step_type`` -- previously ``type``.
+      * ``resource_required`` -- previously ``resourceNeeded``.
+
+    The duration is parsed as a float so sub-second precision survives the
+    round-trip (the audit's ``// 60`` truncation bug was the symptom of
+    treating duration as integer minutes).
+    """
+    duration_seconds = float(step_data.get('duration_seconds', 0) or 0)
+    return Step(
+        name=step_data['name'],
+        duration=timedelta(seconds=duration_seconds),
+        step_type=StepType(step_data.get('step_type', 'fixed_duration')),
+        dependencies=step_data.get('dependencies', []),
+        notes=step_data.get('notes'),
+        resource_needed=step_data.get('resource_required'),
+    )
+
+
 @app.route('/api/experiments', methods=['POST'])
 @jwt_required()
 def create_experiment():
     # Create a new experiment
     data = request.json
     username = get_jwt_identity()
-    
+
     experiment = Experiment(
         name=data['name'],
         description=data.get('description', '')
     )
-    
+
     # Add ownership information
     experiment.owner = username
     experiment.shared_with = {}  # username -> permission
-    
+
     for step_data in data.get('steps', []):
-        duration_minutes = int(step_data.get('duration', 0))
-        step = Step(
-            name=step_data['name'],
-            duration=timedelta(minutes=duration_minutes),
-            step_type=StepType(step_data.get('type', 'fixed_duration')),
-            dependencies=step_data.get('dependencies', []),
-            notes=step_data.get('notes'),
-            resource_needed=step_data.get('resourceNeeded')
-        )
+        step = _step_from_payload(step_data)
         experiment.add_step(step)
-    
+
     scheduler.add_experiment(experiment)
 
     if experiment.steps:
@@ -263,15 +228,7 @@ def update_experiment(experiment_id):
         # one (treated as a brand-new step).
         incoming = []
         for step_data in data['steps']:
-            duration_minutes = int(step_data.get('duration', 0))
-            new_step = Step(
-                name=step_data['name'],
-                duration=timedelta(minutes=duration_minutes),
-                step_type=StepType(step_data.get('type', 'fixed_duration')),
-                dependencies=step_data.get('dependencies', []),
-                notes=step_data.get('notes'),
-                resource_needed=step_data.get('resourceNeeded')
-            )
+            new_step = _step_from_payload(step_data)
             if step_data.get('id'):
                 new_step.id = step_data['id']
             incoming.append(new_step)
@@ -627,12 +584,12 @@ def export_experiment(experiment_id):
 
     # Convert to exportable format (strip user-specific data)
     export_data = experiment_to_dict(experiment)
-    
+
     # Remove owner and sharing info for privacy
     if 'owner' in export_data:
         del export_data['owner']
-    if 'sharedWith' in export_data:
-        del export_data['sharedWith']
+    if 'shared_with' in export_data:
+        del export_data['shared_with']
     
     # Create a temporary file
     fd, path = tempfile.mkstemp(suffix='.json')
@@ -693,21 +650,17 @@ def import_experiment():
         experiment.owner = username
         experiment.shared_with = {}
         
-        # Add steps
+        # Add steps. Required-field check accepts the new snake_case keys
+        # (``step_type`` + ``duration_seconds``); export files written by the
+        # backend always emit those, so a round-trip never loses steps.
         for step_data in data.get('steps', []):
-            # Ensure step has required fields
-            if 'name' not in step_data or 'type' not in step_data or 'duration' not in step_data:
+            if (
+                'name' not in step_data
+                or 'step_type' not in step_data
+                or 'duration_seconds' not in step_data
+            ):
                 continue
-            
-            duration_minutes = int(step_data.get('duration', 0))
-            step = Step(
-                name=step_data['name'],
-                duration=timedelta(minutes=duration_minutes),
-                step_type=StepType(step_data.get('type', 'fixed_duration')),
-                dependencies=step_data.get('dependencies', []),
-                notes=step_data.get('notes', ''),
-                resource_needed=step_data.get('resourceNeeded', '')
-            )
+            step = _step_from_payload(step_data)
             experiment.add_step(step)
         
         # Add to scheduler (persists to DB).
@@ -739,10 +692,10 @@ def create_template():
     username = get_jwt_identity()
     data = request.json or {}
 
-    if 'experimentId' not in data or 'name' not in data:
+    if 'experiment_id' not in data or 'name' not in data:
         return jsonify({"error": "Experiment ID and template name are required"}), 400
 
-    experiment_id = data['experimentId']
+    experiment_id = data['experiment_id']
     template_name = data['name']
 
     experiment = scheduler.experiments.get(experiment_id)
@@ -752,23 +705,12 @@ def create_template():
     if getattr(experiment, 'owner', None) != username:
         return jsonify({"error": "Only the owner can create templates from this experiment"}), 403
 
-    steps_payload = []
-    for step_id, step in experiment.steps.items():
-        steps_payload.append({
-            'name': step.name,
-            'type': step.step_type.value,
-            'duration': step.duration.total_seconds() // 60,
-            'dependencies': step.dependencies,
-            'notes': step.notes,
-            'resourceNeeded': step.resource_needed,
-        })
-
     template = TemplateORM(
         id=str(uuid.uuid4()),
         owner=username,
         name=template_name,
         source_experiment_id=experiment_id,
-        steps_payload=steps_payload,
+        steps_payload=template_steps_payload(experiment),
     )
     db.session.add(template)
     db.session.commit()
@@ -806,15 +748,13 @@ def create_from_template(template_id):
     experiment.shared_with = {}
 
     for step_data in (template.steps_payload or []):
-        duration_minutes = int(step_data.get('duration', 0))
-        step = Step(
-            name=step_data['name'],
-            duration=timedelta(minutes=duration_minutes),
-            step_type=StepType(step_data.get('type', 'fixed_duration')),
-            dependencies=step_data.get('dependencies', []),
-            notes=step_data.get('notes', ''),
-            resource_needed=step_data.get('resourceNeeded', '')
-        )
+        # Templates store snake_case (U8). Older templates created before the
+        # rename are accepted via ``_step_from_payload``'s defaults: missing
+        # ``duration_seconds`` falls back to 0, missing ``step_type`` to
+        # FIXED_DURATION. We don't try to translate ancient ``duration``
+        # (minutes) keys here; that conversion happens once at migration time
+        # if/when we ever need it.
+        step = _step_from_payload(step_data)
         experiment.add_step(step)
 
     scheduler.add_experiment(experiment)

@@ -176,8 +176,8 @@ def test_put_preserves_running_step_state(client, auth_headers):
             'name': 'ConcurrentExp',
             'description': 'should preserve in-flight state',
             'steps': [
-                {'name': 'StepOne', 'duration': 5, 'type': 'task', 'dependencies': []},
-                {'name': 'StepTwo', 'duration': 10, 'type': 'task', 'dependencies': []},
+                {'name': 'StepOne', 'duration_seconds': 300, 'step_type': 'task', 'dependencies': []},
+                {'name': 'StepTwo', 'duration_seconds': 600, 'step_type': 'task', 'dependencies': []},
             ],
         },
     )
@@ -211,8 +211,8 @@ def test_put_preserves_running_step_state(client, auth_headers):
             'name': 'ConcurrentExp Renamed',
             'description': 'updated',
             'steps': [
-                {'id': step_one_id, 'name': 'StepOne Renamed', 'duration': 5, 'type': 'task'},
-                {'id': step_two_id, 'name': 'StepTwo', 'duration': 10, 'type': 'task'},
+                {'id': step_one_id, 'name': 'StepOne Renamed', 'duration_seconds': 300, 'step_type': 'task'},
+                {'id': step_two_id, 'name': 'StepTwo', 'duration_seconds': 600, 'step_type': 'task'},
             ],
         },
     )
@@ -247,8 +247,8 @@ def test_cascade_delete_removes_steps(client, auth_headers):
         json={
             'name': 'DoomedExp',
             'steps': [
-                {'name': 'StepX', 'duration': 5, 'type': 'task'},
-                {'name': 'StepY', 'duration': 7, 'type': 'task'},
+                {'name': 'StepX', 'duration_seconds': 300, 'step_type': 'task'},
+                {'name': 'StepY', 'duration_seconds': 420, 'step_type': 'task'},
             ],
         },
     )
@@ -336,8 +336,8 @@ def test_step_with_no_resource_persists(client, auth_headers):
         json={
             'name': 'NoResourceExp',
             'steps': [
-                {'name': 'PlainStep', 'duration': 5, 'type': 'fixed_duration'},
-                {'name': 'EmptyResourceStep', 'duration': 3, 'type': 'fixed_duration', 'resourceNeeded': ''},
+                {'name': 'PlainStep', 'duration_seconds': 300, 'step_type': 'fixed_duration'},
+                {'name': 'EmptyResourceStep', 'duration_seconds': 180, 'step_type': 'fixed_duration', 'resource_required': ''},
             ],
         },
     )

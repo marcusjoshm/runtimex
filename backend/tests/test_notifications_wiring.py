@@ -45,8 +45,8 @@ def _create_experiment_with_chain(client, headers, name="WiringExp"):
         "name": name,
         "description": "test",
         "steps": [
-            {"name": "S1", "duration": 5, "type": "task", "dependencies": []},
-            {"name": "S2", "duration": 7, "type": "task", "dependencies": []},
+            {"name": "S1", "duration_seconds": 300, "step_type": "task", "dependencies": []},
+            {"name": "S2", "duration_seconds": 420, "step_type": "task", "dependencies": []},
         ],
     }
     r = client.post("/api/experiments", headers=headers, json=payload)
@@ -64,15 +64,15 @@ def _create_experiment_with_chain(client, headers, name="WiringExp"):
             {
                 "id": s1_id,
                 "name": "S1",
-                "type": "task",
-                "duration": 5,
+                "step_type": "task",
+                "duration_seconds": 300,
                 "dependencies": [],
             },
             {
                 "id": s2_id,
                 "name": "S2",
-                "type": "task",
-                "duration": 7,
+                "step_type": "task",
+                "duration_seconds": 420,
                 "dependencies": [s1_id],
             },
         ],
@@ -153,7 +153,7 @@ def test_complete_last_step_emits_no_step_ready(client, auth_headers):
         "name": "Solo",
         "description": "",
         "steps": [
-            {"name": "Only", "duration": 3, "type": "task", "dependencies": []},
+            {"name": "Only", "duration_seconds": 180, "step_type": "task", "dependencies": []},
         ],
     }
     r = client.post("/api/experiments", headers=auth_headers, json=payload)
@@ -188,10 +188,10 @@ def test_save_with_overlapping_resources_emits_one_conflict_notification(client,
         "steps": [
             {
                 "name": "A",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
         ],
     }
@@ -213,17 +213,17 @@ def test_save_with_overlapping_resources_emits_one_conflict_notification(client,
             {
                 "id": a_id,
                 "name": "A",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
             {
                 "name": "B",
-                "type": "fixed_duration",
-                "duration": 60,
+                "step_type": "fixed_duration",
+                "duration_seconds": 3600,
                 "dependencies": [],
-                "resourceNeeded": "microscope",
+                "resource_required": "microscope",
             },
         ],
     }

@@ -1,22 +1,33 @@
 import axios from 'axios';
+import { API_BASE } from './config';
 
-const API_URL = 'http://localhost:5001/api';
-
-// Define interfaces to match backend models
+// Define interfaces to match backend models. All field names are snake_case
+// to match the wire format normalized in U8.
 export interface Step {
   id: string;
   name: string;
-  type: string;
-  duration: number;
+  // Renamed from `type` -> `step_type` so the discriminator field doesn't
+  // clash with TypeScript's reserved-ish `type` keyword in JSX contexts and
+  // matches the backend's `Step.step_type` ORM column.
+  step_type: string;
+  // Duration in SECONDS (float). The pre-U8 wire format used integer minutes
+  // and floor-divided on the server, which truncated sub-minute steps to 0.
+  // Frontend formatters convert seconds -> minutes (or "<1 min") for display.
+  duration_seconds: number;
   status: string;
   dependencies: string[];
   notes?: string;
-  resourceNeeded?: string;
-  scheduledStartTime?: string;
-  scheduledEndTime?: string;
-  actualStartTime?: string;
-  actualEndTime?: string;
-  elapsedTime?: number;
+  resource_required?: string;
+  scheduled_start_time?: string;
+  scheduled_end_time?: string;
+  actual_start_time?: string;
+  first_start_time?: string;
+  actual_end_time?: string;
+  // Server-snapshot of accumulated runtime. The Runner derives a per-tick
+  // elapsed value from `actual_start_time` for sub-second responsiveness;
+  // this field is the cross-pause source of truth and is used for display
+  // when a step is PAUSED.
+  elapsed_seconds?: number;
 }
 
 export interface Experiment {
@@ -25,17 +36,13 @@ export interface Experiment {
   description: string;
   steps: Step[];
   owner?: string;
-  sharedWith?: Record<string, string>; // username -> permission
+  shared_with?: Record<string, string>; // username -> permission
 }
 
 // Resource-conflict descriptor. Returned by GET /api/experiments/<id>/conflicts
 // and surfaced inline in the PUT response (`{ ...experiment, conflicts: [...] }`)
-// so the Designer can warn on save without an extra round-trip.
-//
-// NOTE for U8 (snake_case rename pass): the wire shape is already snake_case
-// here (the backend emits `step_a`, `overlap_seconds`, etc.), so this
-// interface is pre-aligned -- when U8 normalizes the rest of the surface to
-// snake_case, this one will need no changes.
+// so the Designer can warn on save without an extra round-trip. Snake_case
+// since pre-U6.
 export interface Conflict {
   step_a: string;
   step_b: string;
@@ -54,20 +61,20 @@ export type ExperimentSaveResponse = Experiment & { conflicts?: Conflict[] };
 const apiClient = {
   // Experiment API methods
   getExperiments: async (): Promise<Experiment[]> => {
-    const response = await axios.get(`${API_URL}/experiments`);
+    const response = await axios.get(`${API_BASE}/experiments`);
     return response.data;
   },
-  
+
   getExperiment: async (id: string): Promise<Experiment> => {
-    const response = await axios.get(`${API_URL}/experiments/${id}`);
+    const response = await axios.get(`${API_BASE}/experiments/${id}`);
     return response.data;
   },
-  
+
   createExperiment: async (experiment: Omit<Experiment, 'id'>): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/experiments`, experiment);
+    const response = await axios.post(`${API_BASE}/experiments`, experiment);
     return response.data;
   },
-  
+
   updateExperiment: async (
     id: string,
     experiment: Partial<Experiment>
@@ -75,7 +82,7 @@ const apiClient = {
     // Backend returns the full experiment payload + a `conflicts: Conflict[]`
     // field (U6). Callers that don't care about conflicts can ignore it; the
     // Designer reads it on save to surface a warning Alert.
-    const response = await axios.put(`${API_URL}/experiments/${id}`, experiment);
+    const response = await axios.put(`${API_BASE}/experiments/${id}`, experiment);
     return response.data;
   },
 
@@ -84,34 +91,34 @@ const apiClient = {
   // every `experiment_update` socket push without worrying about staleness.
   getConflicts: async (experimentId: string): Promise<Conflict[]> => {
     const response = await axios.get(
-      `${API_URL}/experiments/${experimentId}/conflicts`
+      `${API_BASE}/experiments/${experimentId}/conflicts`
     );
     return response.data;
   },
-  
+
   // Step API methods
   startStep: async (stepId: string): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/steps/${stepId}/start`);
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/start`);
     return response.data;
   },
-  
+
   pauseStep: async (stepId: string): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/steps/${stepId}/pause`);
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/pause`);
     return response.data;
   },
-  
+
   completeStep: async (stepId: string): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/steps/${stepId}/complete`);
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/complete`);
     return response.data;
   },
 
   skipStep: async (stepId: string): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/steps/${stepId}/skip`);
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/skip`);
     return response.data;
   },
 
   getUserExperiments: async (): Promise<Experiment[]> => {
-    const response = await axios.get(`${API_URL}/user/experiments`);
+    const response = await axios.get(`${API_BASE}/user/experiments`);
     return response.data;
   },
 
@@ -123,7 +130,7 @@ const apiClient = {
     // header set by bootstrapAuth/login) and trigger the download from a
     // temporary anchor element.
     const response = await axios.get(
-      `${API_URL}/experiments/${experimentId}/export`,
+      `${API_BASE}/experiments/${experimentId}/export`,
       { responseType: 'blob' }
     );
 
@@ -155,8 +162,8 @@ const apiClient = {
   importExperiment: async (file: File): Promise<Experiment> => {
     const formData = new FormData();
     formData.append('file', file);
-    
-    const response = await axios.post(`${API_URL}/experiments/import`, formData, {
+
+    const response = await axios.post(`${API_BASE}/experiments/import`, formData, {
       headers: {
         'Content-Type': 'multipart/form-data'
       }
@@ -166,24 +173,27 @@ const apiClient = {
 
   // Template management
   getTemplates: async (): Promise<any[]> => {
-    const response = await axios.get(`${API_URL}/templates`);
+    const response = await axios.get(`${API_BASE}/templates`);
     return response.data;
   },
 
   createTemplate: async (experimentId: string, name: string): Promise<any> => {
-    const response = await axios.post(`${API_URL}/templates`, {
-      experimentId,
+    // Wire field is `experiment_id` (U8 snake_case). The TS function signature
+    // keeps camelCase parameters because they're just locals -- the wire
+    // shape is what U8 normalizes.
+    const response = await axios.post(`${API_BASE}/templates`, {
+      experiment_id: experimentId,
       name
     });
     return response.data;
   },
 
   deleteTemplate: async (templateId: string): Promise<void> => {
-    await axios.delete(`${API_URL}/templates/${templateId}`);
+    await axios.delete(`${API_BASE}/templates/${templateId}`);
   },
 
   createFromTemplate: async (templateId: string, name?: string): Promise<Experiment> => {
-    const response = await axios.post(`${API_URL}/experiments/create-from-template/${templateId}`, {
+    const response = await axios.post(`${API_BASE}/experiments/create-from-template/${templateId}`, {
       name
     });
     return response.data;
@@ -191,11 +201,11 @@ const apiClient = {
 
   // Share experiment
   shareExperiment: async (experimentId: string, username: string, permission: 'view' | 'edit'): Promise<void> => {
-    await axios.post(`${API_URL}/experiments/${experimentId}/share`, {
+    await axios.post(`${API_BASE}/experiments/${experimentId}/share`, {
       username,
       permission
     });
   }
 };
 
-export default apiClient; 
+export default apiClient;
