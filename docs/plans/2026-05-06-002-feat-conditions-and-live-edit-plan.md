@@ -1,7 +1,7 @@
 ---
 title: "feat: First-class Conditions + reactive live-edit + tablet focus mode"
 type: feat
-status: active
+status: completed
 date: 2026-05-06
 origin: docs/brainstorms/2026-05-06-conditions-and-live-edit-requirements.md
 ---
