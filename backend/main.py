@@ -32,7 +32,7 @@ from models import (
     TemplateORM,
     UserORM,
 )
-from scheduler import Scheduler
+from scheduler import Scheduler, ScheduleConflictError
 import auth
 from permissions import (
     can_view_experiment,
@@ -143,6 +143,33 @@ def get_experiment(experiment_id):
 
     return jsonify(experiment_to_dict(experiment))
 
+def _coerce_prewarning_offsets(raw) -> list:
+    """Normalize pre-warning offsets from a wire payload into List[int].
+
+    The Designer sends positive integers; we accept floats / strings too and
+    coerce-or-drop. Negative / zero values are filtered out (a "pre-warning"
+    at the moment of completion is meaningless; a negative offset is
+    nonsense). Duplicates are de-duped while preserving order so the
+    Designer's chip list and the persisted list stay aligned.
+    """
+    if not raw:
+        return []
+    seen = set()
+    out = []
+    for entry in raw:
+        try:
+            n = int(entry)
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
 def _step_from_payload(step_data: dict) -> Step:
     """Build a ``Step`` from an incoming JSON payload.
 
@@ -163,6 +190,35 @@ def _step_from_payload(step_data: dict) -> Step:
         dependencies=step_data.get('dependencies', []),
         notes=step_data.get('notes'),
         resource_needed=step_data.get('resource_required'),
+        condition_id=step_data.get('condition_id'),
+        # U3 cascading time: round-trip the opt-in inherit directive. Either a
+        # sibling Step's id (within the same Condition) or the literal
+        # "previous". Resolution lives in start_step (below).
+        inherits_elapsed_from=step_data.get('inherits_elapsed_from'),
+        # U4 pre-warnings. Configuration only -- ``prewarnings_fired`` is
+        # server-tracked dedup state and is never accepted from the wire (the
+        # client cannot pretend it has already received a warning).
+        prewarning_offsets_seconds=_coerce_prewarning_offsets(
+            step_data.get('prewarning_offsets_seconds')
+        ),
+    )
+
+
+def _condition_from_payload(experiment_id: str, condition_data, default_order: int = 0):
+    """Build a Condition dataclass from the request body shape.
+
+    Honors a client-supplied ``id`` (so existing Conditions can round-trip on
+    PUT) and falls back to a fresh UUID. Defaults missing color/order_index
+    to safe values.
+    """
+    from models import Condition  # local import; main.py already imports models
+    return Condition(
+        experiment_id=experiment_id,
+        name=condition_data['name'],
+        color=condition_data.get('color', 'slate'),
+        order_index=int(condition_data.get('order_index', default_order)),
+        description=condition_data.get('description'),
+        id=condition_data.get('id'),
     )
 
 
@@ -182,11 +238,45 @@ def create_experiment():
     experiment.owner = username
     experiment.shared_with = {}  # username -> permission
 
+    # Conditions: accept from body if provided. If absent, auto-create a default
+    # "Main" Condition that owns all of this experiment's Steps. Same shape the
+    # backfill in db._run_migrations() produces, so legacy and fresh data look
+    # identical from the route handler's perspective.
+    incoming_conditions = data.get('conditions') or []
+    if incoming_conditions:
+        for idx, cond_data in enumerate(incoming_conditions):
+            experiment.add_condition(
+                _condition_from_payload(experiment.id, cond_data, default_order=idx)
+            )
+    else:
+        experiment.ensure_default_condition()
+
+    # Map a name-based fallback so old clients that POST steps without
+    # condition_id can still work: they all land in the default "Main"
+    # Condition. Only used if the client also didn't send a conditions array.
+    default_condition_id = next(iter(experiment.conditions.values())).id
+
     for step_data in data.get('steps', []):
         step = _step_from_payload(step_data)
+        # Honor client-supplied step id so dependencies resolve correctly.
+        # Without this, dependencies: ["step1"] would never match because the
+        # dataclass mints a fresh UUID and "step1" doesn't exist on the
+        # experiment.
+        if step_data.get('id'):
+            step.id = step_data['id']
+        if not step.condition_id:
+            step.condition_id = default_condition_id
+        if step.condition_id not in experiment.conditions:
+            return jsonify({
+                'error': f"Step references unknown condition_id '{step.condition_id}'"
+            }), 400
         experiment.add_step(step)
 
-    scheduler.add_experiment(experiment)
+    try:
+        scheduler.add_experiment(experiment)
+    except ScheduleConflictError as exc:
+        # Cross-condition dependency rejected by _sync_step_dependencies.
+        return jsonify({'error': str(exc)}), 400
 
     if experiment.steps:
         start_time = datetime.now()
@@ -222,7 +312,39 @@ def update_experiment(experiment_id):
     experiment.name = data.get('name', experiment.name)
     experiment.description = data.get('description', experiment.description)
 
+    # Conditions: when present, reconcile by ID. New conditions are added,
+    # existing ones get name/color/order_index/description updates, missing
+    # ones are removed (cascading removes steps assigned to them at the DB
+    # layer thanks to the upsert path that follows).
+    if 'conditions' in data:
+        incoming_conds = data['conditions'] or []
+        incoming_ids = {c.get('id') for c in incoming_conds if c.get('id')}
+        # Remove orphan Conditions not present in the incoming list.
+        for old_id in list(experiment.conditions.keys()):
+            if old_id not in incoming_ids:
+                experiment.conditions.pop(old_id, None)
+        # Apply edits + adds.
+        for idx, cond_data in enumerate(incoming_conds):
+            cond_id = cond_data.get('id')
+            if cond_id and cond_id in experiment.conditions:
+                target = experiment.conditions[cond_id]
+                target.name = cond_data.get('name', target.name)
+                target.color = cond_data.get('color', target.color)
+                target.order_index = int(cond_data.get('order_index', idx))
+                target.description = cond_data.get('description', target.description)
+            else:
+                experiment.add_condition(
+                    _condition_from_payload(experiment.id, cond_data, default_order=idx)
+                )
+
+    # Always ensure at least one Condition exists -- otherwise step.condition_id
+    # has no valid target. The default "Main" matches the backfill shape.
+    if not experiment.conditions:
+        experiment.ensure_default_condition()
+
     if 'steps' in data:
+        default_condition_id = next(iter(experiment.conditions.values())).id
+
         # Build a list of incoming Step objects. If the client sends an `id`
         # we honor it (used by existing-step edits); otherwise we mint a new
         # one (treated as a brand-new step).
@@ -231,14 +353,27 @@ def update_experiment(experiment_id):
             new_step = _step_from_payload(step_data)
             if step_data.get('id'):
                 new_step.id = step_data['id']
+            if not new_step.condition_id:
+                new_step.condition_id = default_condition_id
+            if new_step.condition_id not in experiment.conditions:
+                return jsonify({
+                    'error': f"Step references unknown condition_id '{new_step.condition_id}'"
+                }), 400
             incoming.append(new_step)
 
-        scheduler.upsert_experiment_steps(experiment, incoming)
+        try:
+            scheduler.upsert_experiment_steps(experiment, incoming)
+        except ScheduleConflictError as exc:
+            return jsonify({'error': str(exc)}), 400
 
         # Recalculate schedule for any newly-added (PENDING) steps. Existing
         # RUNNING/COMPLETED steps are skipped by calculate_initial_schedule.
         start_time = datetime.now()
         scheduler.calculate_initial_schedule(start_time=start_time)
+    else:
+        # Conditions changed but steps didn't -- still need to persist the
+        # condition mutations. Re-write the experiment row to flush them.
+        scheduler._persist_experiment(experiment)
 
     # Persist top-level field updates (name, description) too.
     exp_orm = db.session.get(ExperimentORM, experiment.id)
@@ -397,12 +532,128 @@ def _emit_resource_conflict_notifications(experiment, conflicts):
             logger.warning("resource_conflict notification emit failed: %s", exc)
 
 
+def _resolve_inherits_elapsed(step, experiment):
+    """U3: resolve ``step.inherits_elapsed_from`` to a source Step's elapsed.
+
+    Called from ``start_step`` BEFORE ``Step.start()`` runs, so the seed
+    survives the dataclass's own ``elapsed_time`` reset semantics: ``start()``
+    from READY leaves elapsed_time alone (it's already 0 by construction), so
+    pre-populating the dataclass here is enough to flow through to the ORM
+    via ``_persist_step_state``.
+
+    Resolution rules:
+      * ``"previous"`` -> the immediately preceding Step in the SAME Condition
+        ordered by ``created_at`` (the canonical order_by on ``StepORM.steps``
+        and ``ConditionORM.steps``). Falls back to dict insertion order on the
+        dataclass since it mirrors ``ConditionORM.steps``'s order_by.
+      * Any other string -> treated as a Step id; must be in the SAME
+        Condition.
+
+    The seed only fires when the source step has ``actual_end_time`` set
+    (i.e. has COMPLETED). Otherwise we log a warning and proceed with
+    ``elapsed_time = 0``. Cross-Condition references log a warning and skip.
+    First-step-in-Condition case (``"previous"`` with no preceding sibling)
+    silently treats as no-inherit -- ``elapsed_time = 0`` is the natural
+    "nothing to inherit" outcome.
+
+    Pure side-effect on ``step.elapsed_time``; returns nothing.
+    """
+    directive = getattr(step, "inherits_elapsed_from", None)
+    if not directive:
+        return
+    if step.status != StepStatus.READY:
+        # Resume-from-PAUSED already has accumulated elapsed_time; don't clobber it.
+        return
+
+    source = None
+    if directive == "previous":
+        # Order siblings by created_at via the ORM (the dataclass cache loses
+        # that detail). Fall back to insertion order if we can't reach the ORM
+        # (e.g., bare-Scheduler test harnesses without app context).
+        siblings = [
+            s for s in experiment.steps.values()
+            if getattr(s, "condition_id", None) == step.condition_id
+        ]
+        try:
+            from models import StepORM as _StepORM
+            ordered_ids = [
+                row.id for row in (
+                    db.session.query(_StepORM)
+                    .filter(_StepORM.experiment_id == experiment.id)
+                    .filter(_StepORM.condition_id == step.condition_id)
+                    .order_by(_StepORM.created_at)
+                    .all()
+                )
+            ]
+            if ordered_ids:
+                # Reorder dataclass siblings to match created_at order. Steps
+                # not present in ordered_ids (mid-add edge cases) drop out.
+                by_id = {s.id: s for s in siblings}
+                siblings = [by_id[sid] for sid in ordered_ids if sid in by_id]
+        except RuntimeError:
+            pass
+
+        # Find the immediate predecessor.
+        predecessor = None
+        for s in siblings:
+            if s.id == step.id:
+                break
+            predecessor = s
+        if predecessor is None:
+            logger.warning(
+                "inherits_elapsed_from='previous' on step '%s' has no preceding "
+                "sibling in condition %s; proceeding with elapsed=0",
+                step.name, step.condition_id,
+            )
+            return
+        source = predecessor
+    else:
+        source = experiment.steps.get(directive)
+        if source is None:
+            logger.warning(
+                "inherits_elapsed_from='%s' on step '%s' references unknown "
+                "step id; proceeding with elapsed=0",
+                directive, step.name,
+            )
+            return
+        if getattr(source, "condition_id", None) != step.condition_id:
+            logger.warning(
+                "inherits_elapsed_from='%s' on step '%s' references a step in "
+                "a different Condition (%s vs %s); proceeding with elapsed=0",
+                directive, step.name, source.condition_id, step.condition_id,
+            )
+            return
+
+    # Source must have COMPLETED for the seed to be meaningful. A still-RUNNING
+    # source has no final elapsed yet -- skip with a warning rather than seed
+    # from a partial value (which would silently double-count when the source
+    # eventually finishes).
+    if source.actual_end_time is None:
+        logger.warning(
+            "inherits_elapsed_from on step '%s' references step '%s' which has "
+            "not completed yet; proceeding with elapsed=0",
+            step.name, source.name,
+        )
+        return
+
+    step.elapsed_time = source.elapsed_time
+    logger.info(
+        "Step '%s' inheriting elapsed=%ss from '%s'",
+        step.name, step.elapsed_time.total_seconds(), source.name,
+    )
+
+
 @app.route('/api/steps/<step_id>/start', methods=['POST'])
 @jwt_required()
 def start_step(step_id):
     step, experiment, err = _authorize_step_transition(step_id)
     if err is not None:
         return err
+
+    # U3: pre-seed elapsed_time from a sibling before Step.start() flips status.
+    # The seed must happen before scheduler.handle_step_start() so the
+    # _persist_step_state call inside picks up the new elapsed_seconds value.
+    _resolve_inherits_elapsed(step, experiment)
 
     scheduler.handle_step_start(step_id)
     _emit_experiment_update(experiment)
@@ -486,6 +737,140 @@ def skip_step(step_id):
 
     _emit_experiment_update(experiment)
     return jsonify(experiment_to_dict(experiment))
+
+# ---------------------------------------------------------------------------
+# U5 reactive live-edit routes.
+#
+# Two narrow operations the Runner / Designer use to react when reality drifts:
+#
+#   * POST /api/steps/<id>/extend  -- "+5m / -5m" on the active step.
+#   * POST /api/conditions/<id>/push -- "shift this whole Condition by N min".
+#
+# Both follow the same shape as existing step-state routes: JWT-gated,
+# permission-gated, persist via the scheduler, run conflict detection, emit
+# ``experiment_update``, return ``{experiment, conflicts}``.
+# ---------------------------------------------------------------------------
+def _coerce_delta_seconds(payload):
+    """Pull a signed integer ``delta_seconds`` out of a JSON body.
+
+    Accepts numeric strings ("300", "-60") for client-side flexibility; rejects
+    anything non-numeric. Returns ``(delta, error_response)`` so callers can
+    surface a 400 directly without re-implementing the same try/except.
+    """
+    if not isinstance(payload, dict):
+        return None, (jsonify({'error': 'JSON body required'}), 400)
+    raw = payload.get('delta_seconds')
+    if raw is None:
+        return None, (jsonify({'error': 'delta_seconds is required'}), 400)
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, (jsonify({'error': 'delta_seconds must be an integer'}), 400)
+
+
+@app.route('/api/steps/<step_id>/extend', methods=['POST'])
+@jwt_required()
+def extend_step(step_id):
+    """Reactive extend/shrink on the active (or any future) step.
+
+    Wire contract:
+      Request:  ``{"delta_seconds": <int>}`` -- positive extends, negative
+                shrinks. Zero is treated as a no-op (still returns 200 with
+                the current experiment payload so clients can retry idempotently).
+      Response: ``{...experiment_to_dict..., "conflicts": [...], "warning"?: str}``
+
+    Permission policy mirrors other step-state routes via
+    ``_authorize_step_transition``: 404 when the user can't view the parent
+    experiment (existence-privacy), 403 when they can view but not edit.
+
+    Shrink-clamp semantics: a negative delta that would push duration below
+    the step's current ``elapsed_seconds`` clamps to ``elapsed_seconds + 1``
+    and surfaces a ``warning`` field in the response. Plan's contract.
+    """
+    step, experiment, err = _authorize_step_transition(step_id)
+    if err is not None:
+        return err
+
+    delta, err = _coerce_delta_seconds(request.json or {})
+    if err is not None:
+        return err
+
+    changed, warning = scheduler.extend_step_duration(step, delta)
+    if changed:
+        # Re-derive scheduled times for downstream PENDING/READY siblings. The
+        # current step's own scheduled_end_time was already updated inline in
+        # extend_step_duration; calculate_initial_schedule only touches PENDING
+        # steps, so RUNNING/COMPLETED siblings stay put.
+        scheduler.calculate_initial_schedule(start_time=datetime.now())
+        _emit_experiment_update(experiment)
+
+    conflicts = Scheduler.check_for_conflicts(experiment)
+    payload = experiment_to_dict(experiment)
+    payload["conflicts"] = conflicts
+    if warning:
+        payload["warning"] = warning
+    return jsonify(payload)
+
+
+@app.route('/api/conditions/<condition_id>/push', methods=['POST'])
+@jwt_required()
+def push_condition(condition_id):
+    """Shift PENDING/READY steps in a Condition by ``delta_seconds``.
+
+    Wire contract:
+      Request:  ``{"delta_seconds": <int>}``
+      Response: ``{...experiment_to_dict..., "conflicts": [...]}``
+
+    Permission policy: existence-privacy on the parent experiment. We resolve
+    the condition's parent by walking ``scheduler.experiments`` (same pattern
+    as ``_find_experiment_for_step``), so a foreign condition_id and a
+    non-existent condition_id are indistinguishable from the caller's view --
+    both produce 404.
+
+    ``delta_seconds == 0`` is a documented no-op: no DB write, no socket emit,
+    just the current experiment payload. Clients sending zero (e.g. a
+    debounced UI control that snapped to zero) shouldn't see phantom traffic.
+    """
+    delta, err = _coerce_delta_seconds(request.json or {})
+    if err is not None:
+        return err
+
+    username = get_jwt_identity()
+    user = get_user(username) if username else None
+
+    # Resolve the parent experiment by walking the cache. We don't expose
+    # condition existence to unauthorized callers -- the 404 path covers both
+    # "no such condition" and "condition belongs to an experiment you can't
+    # view".
+    experiment = None
+    for exp in scheduler.experiments.values():
+        if condition_id in (exp.conditions or {}):
+            experiment = exp
+            break
+
+    if experiment is None or not can_view_experiment(user, experiment):
+        return jsonify({'error': 'Condition not found'}), 404
+    if not can_edit_experiment(user, experiment):
+        return jsonify({'error': 'edit permission required'}), 403
+
+    if delta == 0:
+        # No-op path: skip DB write + socket emit but still return the
+        # experiment payload + conflicts so clients can use the response
+        # uniformly with the non-zero path.
+        conflicts = Scheduler.check_for_conflicts(experiment)
+        payload = experiment_to_dict(experiment)
+        payload["conflicts"] = conflicts
+        return jsonify(payload)
+
+    moved = scheduler.push_condition(experiment, condition_id, delta)
+    if moved:
+        _emit_experiment_update(experiment)
+
+    conflicts = Scheduler.check_for_conflicts(experiment)
+    payload = experiment_to_dict(experiment)
+    payload["conflicts"] = conflicts
+    return jsonify(payload)
+
 
 # Add a route to get user's experiments
 @app.route('/api/user/experiments', methods=['GET'])
@@ -839,6 +1224,102 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     print('Client disconnected')
+
+
+@socketio.on('prewarning_hit')
+def handle_prewarning_hit(payload):
+    """Server-side dedupe for U4 pre-warnings.
+
+    Contract: clients tick once per second and emit ``prewarning_hit`` with
+    ``{step_id, offset_seconds}`` whenever ``(expected_end - now) <= offset``
+    AND the offset isn't yet in ``prewarnings_fired``. The server is the
+    source of truth for "did we already fire this offset?" -- on receipt:
+
+      * Validate the JWT (same query-string transport as ``connect``).
+      * Resolve the step + experiment. Silent no-op (NOT 401) if the user
+        can't view the experiment -- consistent with existing connect-handler
+        behaviour. We don't want this socket event to be a probe vector for
+        existence-privacy.
+      * Validate ``offset_seconds`` is in ``step.prewarning_offsets_seconds``
+        AND NOT already in ``step.prewarnings_fired``.
+      * On valid+fresh: append to ``prewarnings_fired``, persist via
+        ``scheduler._persist_step_state``, fire the notification factory,
+        emit experiment_update so other tabs see the updated fired list.
+      * On duplicate: silent no-op.
+
+    Limitation accepted in v1: pre-warnings only fire when at least one user
+    client has the Runner open. Background-tick delivery is the deferred
+    follow-up. See plan §"Pre-warning delivery" for the rationale.
+    """
+    try:
+        verify_jwt_in_request(locations=['query_string'])
+        username = get_jwt_identity()
+    except Exception:
+        # Unauthenticated client -- silently drop. We deliberately don't emit
+        # an error event back; clients can't recover from missing auth here
+        # and a leaked error type would help an attacker probe.
+        return
+
+    if not isinstance(payload, dict):
+        return
+    step_id = payload.get('step_id')
+    raw_offset = payload.get('offset_seconds')
+    if not step_id or raw_offset is None:
+        return
+    try:
+        offset_seconds = int(raw_offset)
+    except (TypeError, ValueError):
+        return
+
+    user = get_user(username) if username else None
+    step = scheduler.get_step(step_id)
+    experiment = _find_experiment_for_step(step_id) if step else None
+    if not step or not experiment:
+        return
+    # Existence-privacy: a user without view permission learns nothing here.
+    # No 401 / no error event -- just return silently.
+    if not can_view_experiment(user, experiment):
+        return
+
+    # Validate the offset is one the step actually declared. Defensive: don't
+    # let a malicious client pollute prewarnings_fired with arbitrary numbers.
+    declared = list(step.prewarning_offsets_seconds or [])
+    if offset_seconds not in declared:
+        return
+
+    fired = list(step.prewarnings_fired or [])
+    if offset_seconds in fired:
+        # Duplicate fire -- the dedupe contract holds. The second emitter
+        # gets a silent no-op; their UI will see the post-fire experiment
+        # snapshot via the broadcast we already sent on the first emit.
+        return
+
+    # Fresh fire. Append + persist before broadcasting so any client that
+    # immediately re-fetches sees the updated state.
+    fired.append(offset_seconds)
+    step.prewarnings_fired = fired
+    try:
+        scheduler._persist_step_state(step)
+    except Exception as exc:
+        logger.warning("prewarning_hit persist failed: %s", exc)
+        # Don't fan out the notification on persist failure -- the dedupe
+        # state didn't actually save, so a retry should still fire it.
+        return
+
+    owner = getattr(experiment, "owner", None)
+    if owner:
+        try:
+            notification = notification_factories["step_prewarning"](
+                step, experiment, offset_seconds, target_users=[owner]
+            )
+            notification_service.add_notification(notification)
+        except Exception as exc:
+            logger.warning("step_prewarning notification emit failed: %s", exc)
+
+    # Push the updated experiment so every connected client (including other
+    # tabs of the same user) refreshes their local prewarnings_fired list and
+    # stops emitting for this offset.
+    _emit_experiment_update(experiment)
 
 if __name__ == "__main__":
     # Start the Flask app on port 5001 to avoid macOS AirTunes conflict on port 5000.

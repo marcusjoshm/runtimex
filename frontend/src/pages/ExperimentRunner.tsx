@@ -1,38 +1,31 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  Backdrop,
   Box,
   Button,
-  Card,
-  CardContent,
-  CardActions,
-  Chip,
   Container,
   Grid,
   LinearProgress,
   Paper,
+  Stack,
   Typography,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
-  List,
-  ListItem,
-  ListItemText,
-  Divider,
   IconButton,
-  Alert
+  Alert,
+  AlertTitle,
+  Snackbar,
+  useMediaQuery,
 } from '@mui/material';
-import PlayArrowIcon from '@mui/icons-material/PlayArrow';
-import PauseIcon from '@mui/icons-material/Pause';
-import CheckIcon from '@mui/icons-material/Check';
-import TimerIcon from '@mui/icons-material/Timer';
-import SkipNextIcon from '@mui/icons-material/SkipNext';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
-import ErrorIcon from '@mui/icons-material/Error';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
-import apiClient, { Experiment, Step, Conflict } from '../api/client';
+import apiClient, { Experiment, Step, Condition, Conflict } from '../api/client';
 import socketService from '../api/socket';
+import ConditionLane from '../components/ConditionLane';
+import FocusModeRunner from '../components/FocusModeRunner';
 
 // Maps to match backend enum values
 const StepStatus = {
@@ -55,7 +48,16 @@ const StepType = {
 const ExperimentRunner: React.FC = () => {
   const { experimentId } = useParams<{ experimentId: string }>();
   const navigate = useNavigate();
-  
+  const [searchParams] = useSearchParams();
+
+  // U7: focus mode is opted into via `?mode=focus` OR auto-applied on small
+  // viewports (tablet + phone). The branching happens once per render at the
+  // bottom of this component; all state, handlers, and socket subscriptions
+  // are shared between the two layouts so swapping is just a presentation
+  // switch -- no double-mount, no re-fetch.
+  const isSmallViewport = useMediaQuery('(max-width:900px)');
+  const isFocusMode = searchParams.get('mode') === 'focus' || isSmallViewport;
+
   const [experiment, setExperiment] = useState<Experiment | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +71,24 @@ const ExperimentRunner: React.FC = () => {
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [showInfoDialog, setShowInfoDialog] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  // U5 live-edit feedback. Both the server's clamp warning and any error
+  // from the extend round-trip surface here. We keep the message and
+  // severity together so the Snackbar can render the right color without a
+  // second piece of state. ``null`` => not visible.
+  const [liveEditFeedback, setLiveEditFeedback] = useState<{
+    message: string;
+    severity: 'success' | 'warning' | 'error';
+  } | null>(null);
+
+  // U7: pending pre-warning for focus mode. The U4 client-fire path also
+  // populates this so the Backdrop overlay below can interrupt the operator
+  // until they acknowledge. Swimlane mode ignores this state -- the existing
+  // inline Alert + NotificationCenter coverage there is sufficient.
+  const [pendingPrewarning, setPendingPrewarning] = useState<{
+    stepId: string;
+    stepName: string;
+    offsetSeconds: number;
+  } | null>(null);
 
   // ``experimentRef`` exists so the once-per-mount tick interval below can
   // read the latest experiment without listing it as an effect dependency.
@@ -258,6 +278,16 @@ const ExperimentRunner: React.FC = () => {
     handleStepCompleteRef.current = handleStepComplete;
   }, [handleStepComplete]);
 
+  // U4 pre-warnings: track which (stepId, offset) pairs we've ALREADY emitted
+  // during the lifetime of this Runner mount. The server's ``prewarnings_fired``
+  // list is the durable source of truth, but its update arrives via the next
+  // ``experiment_update`` socket push; until that push lands we'd otherwise
+  // re-emit on every tick. This local set bridges the latency: a tick after
+  // an emit checks the set first and doesn't re-fire even before the server
+  // round-trips the new state. Cleared on unmount; on reconnect / remount the
+  // server's prewarnings_fired list is the dedupe authority anyway.
+  const localPrewarningEmits = useRef<Set<string>>(new Set());
+
   // Per-second tick: refresh ``currentTime`` so the running-step elapsed
   // counter re-renders, and auto-complete any FIXED_DURATION step that has
   // run past its budget.
@@ -289,6 +319,54 @@ const ExperimentRunner: React.FC = () => {
           if (elapsed >= step.duration_seconds) {
             handleStepCompleteRef.current(step.id);
           }
+        }
+
+        // U4 pre-warnings: client-fires + server-dedupes. For any RUNNING
+        // step with declared offsets that haven't yet fired, check whether
+        // ``secondsRemaining <= offset`` and emit ``prewarning_hit``. We
+        // rely on the same per-tick currentTime advance the auto-complete
+        // logic uses; no extra setInterval needed.
+        //
+        // Three skip cases per offset:
+        //   1. server-confirmed in step.prewarnings_fired (post-broadcast)
+        //   2. locally emitted this mount (pre-broadcast latency window)
+        //   3. step isn't actually RUNNING (PENDING / READY etc.)
+        if (
+          step.status === StepStatus.RUNNING &&
+          step.actual_start_time &&
+          step.prewarning_offsets_seconds &&
+          step.prewarning_offsets_seconds.length > 0
+        ) {
+          const elapsedSinceStart = differenceInSeconds(
+            new Date(),
+            parseISO(step.actual_start_time)
+          );
+          // Total elapsed = pre-existing elapsed (e.g. seeded by U3 cascading
+          // time, or accumulated across pause/resume) + the live tick. The
+          // backend's ``Step.start()`` resets actual_start_time to "now" on
+          // every resume but preserves elapsed_seconds across pauses, so this
+          // formula stays correct under pause/resume.
+          const elapsedSoFar = (step.elapsed_seconds || 0) + elapsedSinceStart;
+          const secondsRemaining = step.duration_seconds - elapsedSoFar;
+          const fired = step.prewarnings_fired || [];
+
+          step.prewarning_offsets_seconds.forEach((offset) => {
+            if (fired.includes(offset)) return;
+            const localKey = `${step.id}:${offset}`;
+            if (localPrewarningEmits.current.has(localKey)) return;
+            if (secondsRemaining <= offset) {
+              localPrewarningEmits.current.add(localKey);
+              socketService.emitPrewarningHit(step.id, offset);
+              // U7: surface the prewarning as a full-screen interrupt in
+              // focus mode. The Backdrop overlay renders in the focus
+              // branch below; swimlane keeps the existing inline Alert.
+              setPendingPrewarning({
+                stepId: step.id,
+                stepName: step.name,
+                offsetSeconds: offset,
+              });
+            }
+          });
         }
       });
     }, 1000);
@@ -376,39 +454,85 @@ const ExperimentRunner: React.FC = () => {
     }
   };
 
+  // U5: extend / shrink the active step by a fixed delta (seconds). On 200,
+  // we let the socket's ``experiment_update`` push handle local-state
+  // refresh -- mirrors the existing skip/start/pause/complete pattern that
+  // already lives in this file. The Promise's resolved payload still gets
+  // applied directly so the buttons feel snappy without waiting for the
+  // socket round-trip; both sources converge on the same shape.
+  //
+  // Negative deltas may trigger the server's shrink-clamp; the response
+  // includes a ``warning`` string in that case and we surface it in the
+  // Snackbar. Errors (network / 403 / 404) also land in the Snackbar with
+  // ``severity: 'error'`` so the operator gets a non-blocking signal
+  // without an alert() dialog interrupting the bench flow.
+  const handleExtendStep = async (stepId: string, deltaSeconds: number) => {
+    try {
+      const response = await apiClient.extendStep(stepId, deltaSeconds);
+      setExperiment(response);
+      if (response.warning) {
+        setLiveEditFeedback({ message: response.warning, severity: 'warning' });
+      } else {
+        const sign = deltaSeconds >= 0 ? '+' : '-';
+        const minutes = Math.abs(deltaSeconds) / 60;
+        const label = minutes >= 1
+          ? `${sign}${minutes} min`
+          : `${sign}${Math.abs(deltaSeconds)} sec`;
+        setLiveEditFeedback({
+          message: `Step duration adjusted (${label})`,
+          severity: 'success',
+        });
+      }
+    } catch (err: any) {
+      console.error('Failed to extend step:', err);
+      const status = err?.response?.status;
+      const detail =
+        err?.response?.data?.error ||
+        (status === 403 ? 'Edit permission required'
+         : status === 404 ? 'Step not found'
+         : 'Failed to adjust step duration');
+      setLiveEditFeedback({ message: detail, severity: 'error' });
+    }
+  };
+
   const showStepDetails = (stepId: string) => {
     setSelectedStepId(stepId);
     setShowInfoDialog(true);
   };
 
-  const getStepStatusChip = (status: string) => {
-    switch (status) {
-      case StepStatus.PENDING:
-        return <Chip label="Pending" color="default" size="small" />;
-      case StepStatus.READY:
-        return <Chip label="Ready" color="primary" size="small" />;
-      case StepStatus.RUNNING:
-        return <Chip label="Running" color="secondary" size="small" />;
-      case StepStatus.PAUSED:
-        return <Chip label="Paused" color="warning" size="small" />;
-      case StepStatus.COMPLETED:
-        return <Chip label="Completed" color="success" size="small" icon={<CheckIcon />} />;
-      case StepStatus.SKIPPED:
-        return <Chip label="Skipped" color="default" size="small" icon={<SkipNextIcon />} />;
-      case StepStatus.ERROR:
-        return <Chip label="Error" color="error" size="small" icon={<ErrorIcon />} />;
-      default:
-        return <Chip label={status} size="small" />;
-    }
-  };
-
-  const formatTime = (seconds?: number) => {
-    if (seconds === undefined) return '--:--';
-    const safe = Math.max(0, Math.floor(seconds));
-    const mins = Math.floor(safe / 60);
-    const secs = safe % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
+  // U5 push-condition handler. Centralised here so each lane's "Push" buttons
+  // share the same error / Snackbar plumbing as handleExtendStep above. The
+  // server applies the delta to PENDING/READY steps in the named Condition,
+  // re-runs conflict detection, and broadcasts ``experiment_update``; the
+  // socket handler refreshes our local state independently.
+  const handlePushCondition = useCallback(
+    async (conditionId: string, conditionName: string, deltaSeconds: number) => {
+      try {
+        const response = await apiClient.pushCondition(conditionId, deltaSeconds);
+        setExperiment(response);
+        const sign = deltaSeconds >= 0 ? '+' : '-';
+        const minutes = Math.abs(deltaSeconds) / 60;
+        const label =
+          minutes >= 1 ? `${sign}${minutes} min` : `${sign}${Math.abs(deltaSeconds)} sec`;
+        setLiveEditFeedback({
+          message: `Pushed "${conditionName}" by ${label}`,
+          severity: 'success',
+        });
+      } catch (err: any) {
+        console.error('Failed to push condition:', err);
+        const status = err?.response?.status;
+        const detail =
+          err?.response?.data?.error ||
+          (status === 403
+            ? 'Edit permission required'
+            : status === 404
+            ? 'Condition not found'
+            : 'Failed to push condition');
+        setLiveEditFeedback({ message: detail, severity: 'error' });
+      }
+    },
+    []
+  );
 
   // Convert duration_seconds -> human-readable minutes for the static labels.
   // Sub-minute durations show "<1 min" so a 30-second step doesn't render as
@@ -417,13 +541,6 @@ const ExperimentRunner: React.FC = () => {
     if (!Number.isFinite(seconds) || seconds <= 0) return '0 min';
     if (seconds < 60) return '<1 min';
     return `${Math.floor(seconds / 60)} min`;
-  };
-
-  const getProgress = (step: Step) => {
-    if (!step.elapsed_seconds || step.step_type === StepType.TASK) return 0;
-    if (!step.duration_seconds || step.duration_seconds <= 0) return 0;
-    const progress = (step.elapsed_seconds / step.duration_seconds) * 100;
-    return Math.min(progress, 100);
   };
 
   const formatDateTime = (dateStr?: string) => {
@@ -465,14 +582,119 @@ const ExperimentRunner: React.FC = () => {
   }
 
   const activeStep = activeStepIndex !== null ? experiment.steps[activeStepIndex] : null;
+  const activeStepId = activeStep?.id ?? null;
   const pendingSteps = experiment.steps.filter(step => step.status === StepStatus.PENDING);
   const readySteps = experiment.steps.filter(step => step.status === StepStatus.READY);
   const runningSteps = experiment.steps.filter(step => step.status === StepStatus.RUNNING);
   const completedSteps = experiment.steps.filter(step => step.status === StepStatus.COMPLETED);
   const selectedStep = selectedStepId ? experiment.steps.find(step => step.id === selectedStepId) : null;
 
-  const allStepsComplete = experiment.steps.every(step => 
+  const allStepsComplete = experiment.steps.every(step =>
     step.status === StepStatus.COMPLETED || step.status === StepStatus.SKIPPED);
+
+  // Group steps by Condition for the swimlane layout. We sort lanes by
+  // ``order_index`` so the visual order matches what the Designer's
+  // Conditions sidebar showed at save time. Within each lane we preserve the
+  // experiment.steps array order (the user's authored sequence).
+  //
+  // Why inline rather than lift to a shared util: the Designer's grouping
+  // carries an ``originalIndex`` per entry (so move/delete handlers stay O(1))
+  // -- a contract the Runner doesn't need. Lifting a single util would force
+  // either a wider type or two near-identical groupers; the inline 5-line
+  // map+filter pays its weight here. See the Designer's ``stepsByCondition``
+  // (ExperimentDesigner.tsx) for the shape if/when this needs unifying.
+  const conditions: Condition[] = (experiment.conditions ?? [])
+    .slice()
+    .sort((a, b) => a.order_index - b.order_index);
+  // Defensive fallback: if the experiment payload predates U1 (shouldn't
+  // happen post-backfill, but a stale mock could) we render a single
+  // synthetic "Main" lane so the page doesn't go blank.
+  const lanes: Array<{ condition: Condition; steps: Step[] }> =
+    conditions.length > 0
+      ? conditions.map((c) => ({
+          condition: c,
+          steps: experiment.steps.filter((s) => s.condition_id === c.id),
+        }))
+      : [
+          {
+            condition: {
+              id: 'synthetic-main',
+              experiment_id: experiment.id,
+              name: 'Main',
+              color: 'slate',
+              order_index: 0,
+            },
+            steps: experiment.steps,
+          },
+        ];
+
+  // U7 focus-mode branch: render the FocusModeRunner shell instead of the
+  // swimlane stack. Both layouts share the same experiment state, handlers,
+  // and socket subscription -- only presentation swaps. The Snackbar +
+  // step-detail Dialog are still owned by this page; they render under the
+  // focus shell so a live-edit warning or notification surfaces uniformly.
+  if (isFocusMode) {
+    return (
+      <Container maxWidth="lg" sx={{ p: 0 }}>
+        <FocusModeRunner
+          experiment={experiment}
+          activeStepId={activeStepId}
+          onStartStep={(s) => handleStepStart(s.id)}
+          onPauseStep={(s) => handleStepPause(s.id)}
+          onResumeStep={(s) => handleStepStart(s.id)}
+          onCompleteStep={(s) => handleStepComplete(s.id)}
+          onSkipStep={(s) => handleStepSkip(s.id)}
+          onExtendStep={(s, delta) => handleExtendStep(s.id, delta)}
+          onPushCondition={(cid, name, delta) => handlePushCondition(cid, name, delta)}
+        />
+        <Snackbar
+          open={liveEditFeedback !== null}
+          autoHideDuration={4000}
+          onClose={() => setLiveEditFeedback(null)}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        >
+          {liveEditFeedback ? (
+            <Alert
+              severity={liveEditFeedback.severity}
+              onClose={() => setLiveEditFeedback(null)}
+              sx={{ width: '100%' }}
+            >
+              {liveEditFeedback.message}
+            </Alert>
+          ) : undefined}
+        </Snackbar>
+        {/* U7: full-screen pre-warning interrupt. Acknowledge dismisses; the
+            underlying countdown keeps running; the persisted notification
+            stays in the NotificationCenter drawer. */}
+        <Backdrop
+          open={pendingPrewarning !== null}
+          sx={{ zIndex: (theme) => theme.zIndex.drawer + 1 }}
+        >
+          {pendingPrewarning && (
+            <Alert
+              severity="warning"
+              sx={{ maxWidth: 400, p: 3 }}
+              action={
+                <Button
+                  color="inherit"
+                  size="large"
+                  onClick={() => setPendingPrewarning(null)}
+                >
+                  Acknowledge
+                </Button>
+              }
+            >
+              <AlertTitle>
+                {Math.floor(pendingPrewarning.offsetSeconds / 60)}-min warning
+              </AlertTitle>
+              {pendingPrewarning.stepName}: {pendingPrewarning.offsetSeconds}{' '}
+              seconds remaining.
+            </Alert>
+          )}
+        </Backdrop>
+      </Container>
+    );
+  }
 
   return (
     <Container maxWidth="lg">
@@ -528,136 +750,12 @@ const ExperimentRunner: React.FC = () => {
           </Grid>
         </Paper>
         
-        {/* Active Step Card */}
-        {activeStep && (
-          <Box sx={{ mb: 4 }}>
-            <Typography variant="h5" gutterBottom>
-              Current Step
-            </Typography>
-            <Card>
-              <CardContent>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
-                  <Typography variant="h6">{activeStep.name}</Typography>
-                  {getStepStatusChip(activeStep.status)}
-                </Box>
-                
-                <Grid container spacing={2}>
-                  <Grid item xs={12} md={6}>
-                    <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Type: {activeStep.step_type.replace('_', ' ')}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary" gutterBottom>
-                      Duration: {formatDurationMinutes(activeStep.duration_seconds)}
-                    </Typography>
-                    {activeStep.resource_required && (
-                      <Typography variant="body2" color="text.secondary" gutterBottom>
-                        Resource: {activeStep.resource_required}
-                      </Typography>
-                    )}
-                    {activeStep.notes && (
-                      <Typography variant="body2" gutterBottom>
-                        Notes: {activeStep.notes}
-                      </Typography>
-                    )}
-                  </Grid>
-                  <Grid item xs={12} md={6}>
-                    {activeStep.status === StepStatus.RUNNING && (
-                      <>
-                        <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                          <TimerIcon sx={{ mr: 1 }} />
-                          <Typography variant="h6">
-                            {formatTime(activeStep.elapsed_seconds)}
-                          </Typography>
-                        </Box>
-
-                        {activeStep.step_type !== StepType.TASK && (
-                          <LinearProgress
-                            variant="determinate"
-                            value={getProgress(activeStep)}
-                            sx={{ height: 10, mt: 1 }}
-                          />
-                        )}
-                      </>
-                    )}
-                  </Grid>
-                </Grid>
-              </CardContent>
-              <CardActions>
-                {activeStep.status === StepStatus.READY && (
-                  <Button 
-                    color="primary" 
-                    variant="contained"
-                    startIcon={<PlayArrowIcon />}
-                    onClick={() => handleStepStart(activeStep.id)}
-                  >
-                    Start Step
-                  </Button>
-                )}
-                
-                {activeStep.status === StepStatus.RUNNING && (
-                  <>
-                    {activeStep.step_type === StepType.TASK && (
-                      <Button 
-                        color="warning" 
-                        variant="contained"
-                        startIcon={<PauseIcon />}
-                        onClick={() => handleStepPause(activeStep.id)}
-                      >
-                        Pause
-                      </Button>
-                    )}
-                    
-                    <Button 
-                      color="success" 
-                      variant="contained"
-                      startIcon={<CheckIcon />}
-                      onClick={() => handleStepComplete(activeStep.id)}
-                    >
-                      Complete
-                    </Button>
-                  </>
-                )}
-                
-                {activeStep.status === StepStatus.PAUSED && (
-                  <>
-                    <Button 
-                      color="primary" 
-                      variant="contained"
-                      startIcon={<PlayArrowIcon />}
-                      onClick={() => handleStepResume(activeStep.id)}
-                    >
-                      Resume
-                    </Button>
-                    
-                    <Button 
-                      color="success" 
-                      variant="contained"
-                      startIcon={<CheckIcon />}
-                      onClick={() => handleStepComplete(activeStep.id)}
-                    >
-                      Complete
-                    </Button>
-                  </>
-                )}
-                
-                {activeStep.status !== StepStatus.COMPLETED && activeStep.status !== StepStatus.SKIPPED && (
-                  <Button 
-                    color="error" 
-                    startIcon={<SkipNextIcon />}
-                    onClick={() => handleStepSkip(activeStep.id)}
-                  >
-                    Skip
-                  </Button>
-                )}
-              </CardActions>
-            </Card>
-          </Box>
-        )}
-        
         {/* Resource conflict warnings (U6). Non-blocking on purpose: the
             previous dialog interrupted the user's flow on every Start click.
-            The server's check_for_conflicts powers this list, so it stays
-            consistent with whatever U7 will use to fire notifications. */}
+            The server's check_for_conflicts powers this list (with U2's
+            condition labels), so it stays consistent with whatever U7 will
+            use to fire notifications. Rendered above the swimlanes so a
+            multi-lane experiment shows the cross-lane impact at a glance. */}
         {conflicts.length > 0 && (
           <Alert severity="warning" sx={{ mb: 3 }}>
             <Typography variant="subtitle2" gutterBottom>
@@ -665,44 +763,46 @@ const ExperimentRunner: React.FC = () => {
             </Typography>
             {conflicts.map((c) => (
               <Typography key={`${c.step_a}-${c.step_b}-${c.resource}`} variant="body2">
-                {c.step_a_name} ↔ {c.step_b_name} on {c.resource} ({c.overlap_seconds}s overlap)
+                {c.step_a_name} ({c.condition_a_name}) ↔ {c.step_b_name} ({c.condition_b_name}) on {c.resource} ({c.overlap_seconds}s overlap)
               </Typography>
             ))}
           </Alert>
         )}
 
-        {/* Steps List */}
-        <Box sx={{ mb: 4 }}>
-          <Typography variant="h5" gutterBottom>
-            All Steps
-          </Typography>
-          <List component={Paper}>
-            {experiment.steps.map((step, index) => (
-              <React.Fragment key={step.id}>
-                {index > 0 && <Divider />}
-                <ListItem
-                  secondaryAction={
-                    <Box>
-                      {step.status === StepStatus.RUNNING && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mr: 2 }}>
-                          {formatTime(step.elapsed_seconds)}
-                        </Typography>
-                      )}
-                      {getStepStatusChip(step.status)}
-                    </Box>
-                  }
-                  onClick={() => showStepDetails(step.id)}
-                  sx={{ cursor: 'pointer' }}
-                >
-                  <ListItemText
-                    primary={`${index + 1}. ${step.name}`}
-                    secondary={`Type: ${step.step_type.replace('_', ' ')} | Duration: ${formatDurationMinutes(step.duration_seconds)} | Resource: ${step.resource_required || 'none'}`}
-                  />
-                </ListItem>
-              </React.Fragment>
-            ))}
-          </List>
-        </Box>
+        {/* U6 swimlane layout. One ConditionLane per Condition, sorted by
+            order_index. Each lane handles its own per-step rendering,
+            highlights the active step, surfaces start/pause/complete/skip
+            controls on it, and (when ``onPushCondition`` is provided) shows
+            the +/-5m push controls in its header. The ``onStepClick`` for
+            non-active step cards opens the existing details dialog so the
+            page's information density isn't lost on a single-active-step
+            view. */}
+        <Stack spacing={3} sx={{ mb: 4 }}>
+          {lanes.map(({ condition, steps }) => (
+            <ConditionLane
+              key={condition.id}
+              condition={condition}
+              steps={steps}
+              activeStepId={activeStepId}
+              onStepClick={(s) => showStepDetails(s.id)}
+              onStartStep={(s) => handleStepStart(s.id)}
+              onPauseStep={(s) => handleStepPause(s.id)}
+              onResumeStep={(s) => handleStepResume(s.id)}
+              onCompleteStep={(s) => handleStepComplete(s.id)}
+              onSkipStep={(s) => handleStepSkip(s.id)}
+              onExtendStep={(s, delta) => handleExtendStep(s.id, delta)}
+              onPushCondition={
+                // Only attach the push handler for "real" conditions; the
+                // synthetic-main fallback above can't push anything (the
+                // server has no Condition row with that id and would 404).
+                condition.id === 'synthetic-main'
+                  ? undefined
+                  : (delta) =>
+                      handlePushCondition(condition.id, condition.name, delta)
+              }
+            />
+          ))}
+        </Stack>
       </Box>
       
       {/* Step Info Dialog */}
@@ -760,6 +860,30 @@ const ExperimentRunner: React.FC = () => {
           <Button onClick={() => setShowInfoDialog(false)}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      {/* U5 live-edit feedback. The Snackbar is non-blocking on purpose --
+          extend/shrink is a high-frequency operation at the bench, and a
+          modal alert would interrupt the operator's flow on every tap. The
+          severity comes from handleExtendStep: 'warning' for the
+          shrink-clamp message, 'error' for HTTP failures, 'success' for
+          plain extend confirmation. */}
+      <Snackbar
+        open={liveEditFeedback !== null}
+        autoHideDuration={4000}
+        onClose={() => setLiveEditFeedback(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        {liveEditFeedback ? (
+          <Alert
+            onClose={() => setLiveEditFeedback(null)}
+            severity={liveEditFeedback.severity}
+            variant="filled"
+            sx={{ width: '100%' }}
+          >
+            {liveEditFeedback.message}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
     </Container>
   );
 };

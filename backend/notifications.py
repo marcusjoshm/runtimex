@@ -12,6 +12,7 @@ class NotificationType(Enum):
     STEP_COMPLETED = "step_completed"
     STEP_PAUSED = "step_paused"
     STEP_TIMEOUT = "step_timeout"
+    STEP_PREWARNING = "step_prewarning"
     RESOURCE_CONFLICT = "resource_conflict"
     USER_ATTENTION_REQUIRED = "user_attention_required"
     GENERAL_INFO = "general_info"
@@ -445,11 +446,47 @@ def create_notification_factories(scheduler):
             experiment_id=experiment.id,
             step_id=step.id
         )
-    
+
+    def step_prewarning_notification(step, experiment, offset_seconds, target_users=None):
+        """Create a pre-warning notification for a step nearing its end (U4).
+
+        Mirrors the shape of ``step_timeout_notification``: same target-user
+        defaulting, same ``step_id`` / ``experiment_id`` linkage, MEDIUM
+        priority. The ``offset_seconds`` is rendered in the title and message
+        as whole minutes when it divides cleanly, otherwise as raw seconds, so
+        a 600s offset reads "10 minutes" but a 90s offset reads "90 seconds".
+        Stored as ``offset_seconds`` (and the human-friendly ``offset_label``)
+        in metadata so the frontend can render either form without parsing
+        the message.
+        """
+        if offset_seconds % 60 == 0 and offset_seconds >= 60:
+            offset_label = f"{offset_seconds // 60} minutes"
+        else:
+            offset_label = f"{offset_seconds} seconds"
+        return Notification(
+            title=f"Pre-warning: {step.name}",
+            message=(
+                f"{offset_label} remaining on '{step.name}' in experiment "
+                f"'{experiment.name}'."
+            ),
+            notification_type=NotificationType.STEP_PREWARNING,
+            priority=NotificationPriority.MEDIUM,
+            target_users=target_users or (
+                [experiment.owner] if hasattr(experiment, 'owner') else []
+            ),
+            experiment_id=experiment.id,
+            step_id=step.id,
+            metadata={
+                "offset_seconds": offset_seconds,
+                "offset_label": offset_label,
+            },
+        )
+
     return {
         "step_ready": step_ready_notification,
         "step_completed": step_completed_notification,
         "resource_conflict": resource_conflict_notification,
         "user_attention": user_attention_notification,
-        "step_timeout": step_timeout_notification
-    } 
+        "step_timeout": step_timeout_notification,
+        "step_prewarning": step_prewarning_notification,
+    }

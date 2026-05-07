@@ -12,7 +12,7 @@ Covers:
 """
 from datetime import datetime, timedelta
 
-from models import Experiment, Step, StepType
+from models import Condition, Experiment, Step, StepType
 from scheduler import Scheduler
 
 
@@ -206,6 +206,122 @@ def test_conflicts_route_unrelated_user_gets_404(client, auth_headers, second_us
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# 7. U2: conflict payload includes condition labels (id + name) per side.
+# ---------------------------------------------------------------------------
+def test_conflict_payload_includes_condition_labels():
+    """`Covers AE1.` Two Conditions, one shared microscope, overlapping
+    schedule -> the conflict carries condition_a_id/name and condition_b_id/name
+    populated from the experiment's Condition cache.
+    """
+    base = datetime(2026, 1, 1, 14, 0, 0)
+    a = _make_step("Image A", "microscope", base, duration_minutes=30)
+    b = _make_step(
+        "Image B", "microscope", base + timedelta(minutes=10), duration_minutes=30
+    )
+    exp = _experiment_with([a, b])
+
+    cond_a = Condition(
+        experiment_id=exp.id, name="Condition A", color="coral", order_index=0, id="condA"
+    )
+    cond_b = Condition(
+        experiment_id=exp.id, name="Condition B", color="teal", order_index=1, id="condB"
+    )
+    exp.add_condition(cond_a)
+    exp.add_condition(cond_b)
+    a.condition_id = cond_a.id
+    b.condition_id = cond_b.id
+
+    conflicts = Scheduler.check_for_conflicts(exp)
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # Pre-existing fields untouched.
+    assert c["resource"] == "microscope"
+    assert c["overlap_seconds"] == 20 * 60
+    assert {c["step_a"], c["step_b"]} == {a.id, b.id}
+    assert {c["step_a_name"], c["step_b_name"]} == {"Image A", "Image B"}
+
+    # New U2 fields. Pairing is by step_a/step_b ordering (which the algorithm
+    # decides via start-time sort). We just need the *pair* of (id, name) on
+    # each side to match the *pair* on the corresponding step.
+    a_side = (c["condition_a_id"], c["condition_a_name"])
+    b_side = (c["condition_b_id"], c["condition_b_name"])
+    if c["step_a"] == a.id:
+        assert a_side == ("condA", "Condition A")
+        assert b_side == ("condB", "Condition B")
+    else:
+        assert a_side == ("condB", "Condition B")
+        assert b_side == ("condA", "Condition A")
+
+
+# ---------------------------------------------------------------------------
+# 8. U2: a step pointing at a condition_id missing from experiment.conditions
+# (data corruption / mid-edit race) does NOT crash; we emit "Unknown".
+# ---------------------------------------------------------------------------
+def test_conflict_payload_handles_missing_condition_gracefully():
+    """Defensive: a step references a condition that isn't in the cache.
+
+    The detector must not raise; instead it reports the offending side's
+    condition_*_name as "Unknown" and condition_*_id as the step's raw
+    condition_id (which may be a stale FK or None).
+    """
+    base = datetime(2026, 1, 1, 14, 0, 0)
+    a = _make_step("A", "microscope", base, duration_minutes=30)
+    b = _make_step("B", "microscope", base + timedelta(minutes=10), duration_minutes=30)
+    exp = _experiment_with([a, b])
+
+    # Only register a condition for A. B points at a stale condition_id with
+    # no corresponding Condition object.
+    cond_a = Condition(experiment_id=exp.id, name="Condition A", id="condA")
+    exp.add_condition(cond_a)
+    a.condition_id = cond_a.id
+    b.condition_id = "ghost-condition-id"  # never registered on the experiment
+
+    conflicts = Scheduler.check_for_conflicts(exp)
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # Determine which side is which by matching step IDs.
+    if c["step_a"] == a.id:
+        a_id_field, a_name_field = "condition_a_id", "condition_a_name"
+        b_id_field, b_name_field = "condition_b_id", "condition_b_name"
+    else:
+        a_id_field, a_name_field = "condition_b_id", "condition_b_name"
+        b_id_field, b_name_field = "condition_a_id", "condition_a_name"
+
+    assert c[a_id_field] == "condA"
+    assert c[a_name_field] == "Condition A"
+    # The unregistered condition_id is preserved verbatim; the name is "Unknown".
+    assert c[b_id_field] == "ghost-condition-id"
+    assert c[b_name_field] == "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# 9. U2: a step with condition_id=None doesn't crash; both id and name fall
+# back gracefully.
+# ---------------------------------------------------------------------------
+def test_conflict_payload_handles_null_condition_id():
+    """A step with no condition_id at all (pre-backfill / direct dataclass
+    construction) reports condition_*_name = "Unknown", condition_*_id = None.
+    """
+    base = datetime(2026, 1, 1, 14, 0, 0)
+    a = _make_step("A", "microscope", base, duration_minutes=30)
+    b = _make_step("B", "microscope", base + timedelta(minutes=10), duration_minutes=30)
+    exp = _experiment_with([a, b])
+    # Neither step has a condition_id; experiment.conditions is empty.
+    a.condition_id = None
+    b.condition_id = None
+
+    conflicts = Scheduler.check_for_conflicts(exp)
+    assert len(conflicts) == 1
+    c = conflicts[0]
+    assert c["condition_a_id"] is None
+    assert c["condition_b_id"] is None
+    assert c["condition_a_name"] == "Unknown"
+    assert c["condition_b_name"] == "Unknown"
+
+
 def test_update_experiment_response_includes_conflicts(client, auth_headers):
     """PUT /api/experiments/<id> attaches the conflict list to the response so
     the Designer can surface it without an extra fetch (U6 contract).
@@ -252,3 +368,135 @@ def test_update_experiment_response_includes_conflicts(client, auth_headers):
     assert "conflicts" in body
     assert len(body["conflicts"]) == 1
     assert body["conflicts"][0]["resource"] == "microscope"
+
+
+# ---------------------------------------------------------------------------
+# 10. U6: single-Condition Experiment renders the auto-created "Main" lane in
+#     conflict payloads. The Runner uses condition_*_name in the inline alert,
+#     so a multi-resource overlap on a single-condition experiment must surface
+#     the "Main" label on both sides (not "Unknown" -- that's the missing-FK
+#     fallback path tested above).
+# ---------------------------------------------------------------------------
+def test_single_condition_experiment_uses_main_for_both_sides(client, auth_headers):
+    """No `conditions` in the create payload -> backend default-creates a
+    single "Main" Condition that owns every Step. Two microscope steps overlap
+    -> both sides of the conflict carry condition_*_name = "Main" and the same
+    condition_*_id (since they live in the same Condition).
+    """
+    payload = {
+        "name": "SwimlaneSingleMain",
+        "description": "single-condition lane test",
+        "steps": [
+            {
+                "name": "Image dish",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+            },
+            {
+                "name": "Image dish 2",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+            },
+        ],
+    }
+    r = client.post("/api/experiments", headers=auth_headers, json=payload)
+    assert r.status_code == 201, r.get_json()
+    exp_id = r.get_json()["id"]
+    created = r.get_json()
+
+    # Sanity: backend default-created exactly one "Main" Condition.
+    assert len(created["conditions"]) == 1
+    main_cond = created["conditions"][0]
+    assert main_cond["name"] == "Main"
+
+    r = client.get(f"/api/experiments/{exp_id}/conflicts", headers=auth_headers)
+    assert r.status_code == 200, r.get_json()
+    conflicts = r.get_json()
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # The Runner's swimlane Alert renders both sides as "(Main)" so a
+    # single-Condition experiment looks visually equivalent to the legacy
+    # flat-list runner (one lane, one label) -- no "Unknown" leakage.
+    assert c["condition_a_name"] == "Main"
+    assert c["condition_b_name"] == "Main"
+    assert c["condition_a_id"] == main_cond["id"]
+    assert c["condition_b_id"] == main_cond["id"]
+
+
+# ---------------------------------------------------------------------------
+# 11. U6: multi-Condition Experiment with two separately-named Conditions
+#     (microscope steps in each) yields a conflict whose payload labels both
+#     sides distinctly. This is the exact shape the Runner's swimlane Alert
+#     renders ("Image A (Condition A) <-> Image B (Condition B) on microscope").
+# ---------------------------------------------------------------------------
+def test_two_named_conditions_produce_distinct_labels(client, auth_headers):
+    """End-to-end via the Flask client: post a two-Condition experiment with
+    overlapping microscope steps; confirm the conflict payload pairs each
+    step with the *correct* condition name (not just "some name on each side").
+    """
+    payload = {
+        "name": "SwimlaneMultiCondition",
+        "description": "two parallel dishes share the microscope",
+        "conditions": [
+            {"id": "cond-a", "name": "Condition A", "color": "coral", "order_index": 0},
+            {"id": "cond-b", "name": "Condition B", "color": "teal", "order_index": 1},
+        ],
+        "steps": [
+            {
+                "id": "step-a-image",
+                "name": "Image A",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+                "condition_id": "cond-a",
+            },
+            {
+                "id": "step-b-image",
+                "name": "Image B",
+                "step_type": "fixed_duration",
+                "duration_seconds": 1800,
+                "dependencies": [],
+                "resource_required": "microscope",
+                "condition_id": "cond-b",
+            },
+        ],
+    }
+    r = client.post("/api/experiments", headers=auth_headers, json=payload)
+    assert r.status_code == 201, r.get_json()
+    exp_id = r.get_json()["id"]
+
+    r = client.get(f"/api/experiments/{exp_id}/conflicts", headers=auth_headers)
+    assert r.status_code == 200, r.get_json()
+    conflicts = r.get_json()
+    assert len(conflicts) == 1
+    c = conflicts[0]
+
+    # Sanity on the resource + ids regardless of pair ordering.
+    assert c["resource"] == "microscope"
+    assert {c["step_a"], c["step_b"]} == {"step-a-image", "step-b-image"}
+    assert {c["condition_a_id"], c["condition_b_id"]} == {"cond-a", "cond-b"}
+    assert {c["condition_a_name"], c["condition_b_name"]} == {
+        "Condition A",
+        "Condition B",
+    }
+
+    # Critical: the (id, name) pairs match step-by-step. If A's step is in
+    # the a_ position then A's condition must be the a_ condition, and same
+    # for B. This is the contract the Runner relies on when rendering
+    # "{step_a_name} ({condition_a_name}) <-> {step_b_name} ({condition_b_name})".
+    if c["step_a"] == "step-a-image":
+        assert c["condition_a_id"] == "cond-a"
+        assert c["condition_a_name"] == "Condition A"
+        assert c["condition_b_id"] == "cond-b"
+        assert c["condition_b_name"] == "Condition B"
+    else:
+        assert c["condition_a_id"] == "cond-b"
+        assert c["condition_a_name"] == "Condition B"
+        assert c["condition_b_id"] == "cond-a"
+        assert c["condition_b_name"] == "Condition A"

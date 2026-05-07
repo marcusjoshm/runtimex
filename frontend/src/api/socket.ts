@@ -105,6 +105,28 @@ class SocketService {
     }
   }
 
+  /**
+   * U4: emit a ``prewarning_hit`` event for a step + offset combination.
+   *
+   * Contract (server-side dedupe): the Runner ticks once per second and
+   * crosses each declared offset for the active step. When a threshold is
+   * crossed AND the offset isn't already in ``step.prewarnings_fired``, we
+   * emit here. The server appends-once and fires a notification; subsequent
+   * emits for the same (step, offset) are silent no-ops.
+   *
+   * Wire shape is snake_case end-to-end (U8). Field names match what the
+   * server's ``handle_prewarning_hit`` expects -- ``step_id`` /
+   * ``offset_seconds``.
+   */
+  emitPrewarningHit(stepId: string, offsetSeconds: number) {
+    if (this.socket) {
+      this.socket.emit('prewarning_hit', {
+        step_id: stepId,
+        offset_seconds: offsetSeconds,
+      });
+    }
+  }
+
   on(event: string, handler: (data: any) => void) {
     if (this.socket) {
       this.socket.on(event, handler);

@@ -28,6 +28,43 @@ export interface Step {
   // this field is the cross-pause source of truth and is used for display
   // when a step is PAUSED.
   elapsed_seconds?: number;
+  // Condition this step belongs to. Always present for persisted steps once
+  // U1 is shipped; legacy data is auto-backfilled to a "Main" Condition.
+  condition_id?: string;
+  // U3 cascading time: opt-in directive copied verbatim from the wire. Either
+  // the literal string "previous" (server resolves to the immediately
+  // preceding sibling in the same Condition) or a sibling Step's id. Absent /
+  // undefined means "no inherit". The Designer's per-step toggle writes
+  // "previous"; the Runner does NOT re-derive countdown from this field --
+  // the server pre-seeds elapsed_seconds on START so the existing
+  // ``duration_seconds - elapsed_seconds`` math just works.
+  inherits_elapsed_from?: string;
+  // U4 pre-warnings. Two parallel int-second lists:
+  // * ``prewarning_offsets_seconds`` -- user-configured "warn me N seconds
+  //   before expected end" thresholds. The Designer manages this list; the
+  //   Runner reads it on every tick.
+  // * ``prewarnings_fired`` -- server-tracked dedupe state. The Runner
+  //   reads it to know which offsets have already delivered (don't re-fire);
+  //   the server is the only writer (via the prewarning_hit socket handler).
+  // Both keys are present on every persisted step (even when empty) so the
+  // Runner can iterate without optional-chaining branches.
+  prewarning_offsets_seconds?: number[];
+  prewarnings_fired?: number[];
+}
+
+// Condition: a named grouping of steps within an Experiment. Multiple
+// conditions run in parallel (e.g. "Dish 1 / Dish 2 / Dish 3"), can share
+// resources, and can drift in shape from each other. The `color` is one of
+// the 10 predefined palette keys (slate, coral, forest, lavender, amber,
+// teal, magenta, mint, navy, gold) -- see ConditionPaletteSwatch.tsx for the
+// canonical list and the MUI mapping.
+export interface Condition {
+  id: string;
+  experiment_id: string;
+  name: string;
+  color: string;
+  order_index: number;
+  description?: string;
 }
 
 export interface Experiment {
@@ -35,6 +72,9 @@ export interface Experiment {
   name: string;
   description: string;
   steps: Step[];
+  // U1 ships this as a sibling array on the wire. Optional in the type so
+  // legacy mock data and partial-update payloads still type-check.
+  conditions?: Condition[];
   owner?: string;
   shared_with?: Record<string, string>; // username -> permission
 }
@@ -50,12 +90,31 @@ export interface Conflict {
   overlap_seconds: number;
   step_a_name: string;
   step_b_name: string;
+  // Condition labels (U2). Always populated server-side; the name falls back
+  // to "Unknown" when the step's condition_id can't be resolved against the
+  // experiment's Condition cache (defensive against mid-edit race / legacy
+  // data). condition_*_id may be null for pre-U1 steps that escaped backfill.
+  condition_a_id?: string | null;
+  condition_a_name: string;
+  condition_b_id?: string | null;
+  condition_b_name: string;
 }
 
 // Response shape for createExperiment / updateExperiment. The PUT path
 // includes `conflicts`; the POST path doesn't (yet) but typing it as
 // optional means the Designer can read it uniformly.
 export type ExperimentSaveResponse = Experiment & { conflicts?: Conflict[] };
+
+// U5 live-edit response shape. Both /api/steps/<id>/extend and
+// /api/conditions/<id>/push return the full experiment payload + the
+// post-mutation conflict list. Extend may also return a `warning` string
+// when a negative delta clamps duration to current elapsed.
+export type LiveEditResponse = Experiment & {
+  conflicts: Conflict[];
+  // Only present on extend when shrink-clamp triggered. Surface verbatim in
+  // a Snackbar / Alert; the message is human-readable already.
+  warning?: string;
+};
 
 // Create API client
 const apiClient = {
@@ -114,6 +173,42 @@ const apiClient = {
 
   skipStep: async (stepId: string): Promise<Experiment> => {
     const response = await axios.post(`${API_BASE}/steps/${stepId}/skip`);
+    return response.data;
+  },
+
+  // U5 live-edit: extend (or shrink) the active step's duration. Positive
+  // ``deltaSeconds`` extends; negative shrinks. The server clamps negative
+  // deltas that would push duration below the current ``elapsed_seconds``
+  // and returns a ``warning`` string in that case -- callers should surface
+  // it (Snackbar / inline Alert) so the user understands why the duration
+  // didn't shrink as much as they asked. The server also re-runs conflict
+  // detection and broadcasts ``experiment_update``, so the Runner socket
+  // subscription will refresh local state independently of this Promise.
+  extendStep: async (
+    stepId: string,
+    deltaSeconds: number
+  ): Promise<LiveEditResponse> => {
+    const response = await axios.post(`${API_BASE}/steps/${stepId}/extend`, {
+      delta_seconds: deltaSeconds,
+    });
+    return response.data;
+  },
+
+  // U5 live-edit: push (shift) a Condition's PENDING/READY steps by
+  // ``deltaSeconds``. RUNNING / COMPLETED / SKIPPED / PAUSED steps are NOT
+  // moved (the operator-facing label clarifies this as "shifts upcoming
+  // steps in this condition"). ``deltaSeconds === 0`` is a documented no-op
+  // -- still returns 200 with the current experiment payload, so callers
+  // don't need to special-case zero. U6 reuses this client method to power
+  // the lane-header push controls.
+  pushCondition: async (
+    conditionId: string,
+    deltaSeconds: number
+  ): Promise<LiveEditResponse> => {
+    const response = await axios.post(
+      `${API_BASE}/conditions/${conditionId}/push`,
+      { delta_seconds: deltaSeconds }
+    );
     return response.data;
   },
 
