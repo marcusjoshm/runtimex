@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  Backdrop,
   Box,
   Button,
   Container,
@@ -15,13 +16,16 @@ import {
   DialogActions,
   IconButton,
   Alert,
+  AlertTitle,
   Snackbar,
+  useMediaQuery,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import { format, differenceInSeconds, parseISO } from 'date-fns';
 import apiClient, { Experiment, Step, Condition, Conflict } from '../api/client';
 import socketService from '../api/socket';
 import ConditionLane from '../components/ConditionLane';
+import FocusModeRunner from '../components/FocusModeRunner';
 
 // Maps to match backend enum values
 const StepStatus = {
@@ -44,7 +48,16 @@ const StepType = {
 const ExperimentRunner: React.FC = () => {
   const { experimentId } = useParams<{ experimentId: string }>();
   const navigate = useNavigate();
-  
+  const [searchParams] = useSearchParams();
+
+  // U7: focus mode is opted into via `?mode=focus` OR auto-applied on small
+  // viewports (tablet + phone). The branching happens once per render at the
+  // bottom of this component; all state, handlers, and socket subscriptions
+  // are shared between the two layouts so swapping is just a presentation
+  // switch -- no double-mount, no re-fetch.
+  const isSmallViewport = useMediaQuery('(max-width:900px)');
+  const isFocusMode = searchParams.get('mode') === 'focus' || isSmallViewport;
+
   const [experiment, setExperiment] = useState<Experiment | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +78,16 @@ const ExperimentRunner: React.FC = () => {
   const [liveEditFeedback, setLiveEditFeedback] = useState<{
     message: string;
     severity: 'success' | 'warning' | 'error';
+  } | null>(null);
+
+  // U7: pending pre-warning for focus mode. The U4 client-fire path also
+  // populates this so the Backdrop overlay below can interrupt the operator
+  // until they acknowledge. Swimlane mode ignores this state -- the existing
+  // inline Alert + NotificationCenter coverage there is sufficient.
+  const [pendingPrewarning, setPendingPrewarning] = useState<{
+    stepId: string;
+    stepName: string;
+    offsetSeconds: number;
   } | null>(null);
 
   // ``experimentRef`` exists so the once-per-mount tick interval below can
@@ -334,6 +357,14 @@ const ExperimentRunner: React.FC = () => {
             if (secondsRemaining <= offset) {
               localPrewarningEmits.current.add(localKey);
               socketService.emitPrewarningHit(step.id, offset);
+              // U7: surface the prewarning as a full-screen interrupt in
+              // focus mode. The Backdrop overlay renders in the focus
+              // branch below; swimlane keeps the existing inline Alert.
+              setPendingPrewarning({
+                stepId: step.id,
+                stepName: step.name,
+                offsetSeconds: offset,
+              });
             }
           });
         }
@@ -596,6 +627,74 @@ const ExperimentRunner: React.FC = () => {
             steps: experiment.steps,
           },
         ];
+
+  // U7 focus-mode branch: render the FocusModeRunner shell instead of the
+  // swimlane stack. Both layouts share the same experiment state, handlers,
+  // and socket subscription -- only presentation swaps. The Snackbar +
+  // step-detail Dialog are still owned by this page; they render under the
+  // focus shell so a live-edit warning or notification surfaces uniformly.
+  if (isFocusMode) {
+    return (
+      <Container maxWidth="lg" sx={{ p: 0 }}>
+        <FocusModeRunner
+          experiment={experiment}
+          activeStepId={activeStepId}
+          onStartStep={(s) => handleStepStart(s.id)}
+          onPauseStep={(s) => handleStepPause(s.id)}
+          onResumeStep={(s) => handleStepStart(s.id)}
+          onCompleteStep={(s) => handleStepComplete(s.id)}
+          onSkipStep={(s) => handleStepSkip(s.id)}
+          onExtendStep={(s, delta) => handleExtendStep(s.id, delta)}
+          onPushCondition={(cid, name, delta) => handlePushCondition(cid, name, delta)}
+        />
+        <Snackbar
+          open={liveEditFeedback !== null}
+          autoHideDuration={4000}
+          onClose={() => setLiveEditFeedback(null)}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        >
+          {liveEditFeedback ? (
+            <Alert
+              severity={liveEditFeedback.severity}
+              onClose={() => setLiveEditFeedback(null)}
+              sx={{ width: '100%' }}
+            >
+              {liveEditFeedback.message}
+            </Alert>
+          ) : undefined}
+        </Snackbar>
+        {/* U7: full-screen pre-warning interrupt. Acknowledge dismisses; the
+            underlying countdown keeps running; the persisted notification
+            stays in the NotificationCenter drawer. */}
+        <Backdrop
+          open={pendingPrewarning !== null}
+          sx={{ zIndex: (theme) => theme.zIndex.drawer + 1 }}
+        >
+          {pendingPrewarning && (
+            <Alert
+              severity="warning"
+              sx={{ maxWidth: 400, p: 3 }}
+              action={
+                <Button
+                  color="inherit"
+                  size="large"
+                  onClick={() => setPendingPrewarning(null)}
+                >
+                  Acknowledge
+                </Button>
+              }
+            >
+              <AlertTitle>
+                {Math.floor(pendingPrewarning.offsetSeconds / 60)}-min warning
+              </AlertTitle>
+              {pendingPrewarning.stepName}: {pendingPrewarning.offsetSeconds}{' '}
+              seconds remaining.
+            </Alert>
+          )}
+        </Backdrop>
+      </Container>
+    );
+  }
 
   return (
     <Container maxWidth="lg">

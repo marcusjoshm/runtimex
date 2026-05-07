@@ -162,11 +162,20 @@ export interface ConditionLaneProps extends ConditionLaneStepActions {
   onStepClick?: (step: Step) => void;
   // Layout variant. "swimlane" (default) is a horizontal row of compact
   // step cards used by the Runner's main grid. "focus" is U7's tablet-mode
-  // single-condition view, where one big card per step makes sense. For U6
-  // the "focus" variant uses the same per-step card render as "swimlane"
-  // but stacks vertically with bigger spacing -- U7 will refine the active
-  // card into the full-screen big-button layout when it lands.
+  // single-condition view: one large active step card with a thumb-sized
+  // button group, big tabular-num countdown, no surrounding lane decoration.
   variant?: 'swimlane' | 'focus';
+  // U7: focus mode renders only the active step (or, if no step is active,
+  // the next READY step / nothing). The other steps in the Condition are
+  // hidden so the operator's eye lands on the one thing they need to act on.
+  // Passed in by FocusModeRunner; the swimlane Runner leaves this false so
+  // the lane keeps its full step roster.
+  hideNonActiveSteps?: boolean;
+  // U7: focus mode hides the lane's own header (palette strip + name +
+  // step-count chip + push controls) because FocusModeRunner renders its
+  // own navigator on top with the same information at tablet-tap size.
+  // Swimlane mode leaves it visible.
+  hideHeader?: boolean;
 }
 
 // Per-step card. Active steps get the full action button row; non-active
@@ -193,6 +202,8 @@ const StepCard: React.FC<{
     status !== StepStatus.COMPLETED &&
     status !== StepStatus.SKIPPED;
 
+  const isFocus = variant === 'focus';
+
   const cardSx = isActive
     ? {
         // Highlight the active step with a left accent strip in the lane's
@@ -200,8 +211,8 @@ const StepCard: React.FC<{
         // lane (saturated palette bg) so the operator can spot the active
         // step even when scanning past chip colors that read similarly on
         // small screens.
-        borderLeft: `4px solid ${laneAccentColor}`,
-        boxShadow: 3,
+        borderLeft: `${isFocus ? 8 : 4}px solid ${laneAccentColor}`,
+        boxShadow: isFocus ? 6 : 3,
       }
     : {
         // Non-active steps: compact, clickable, ghosty. Hover lifts so the
@@ -214,6 +225,183 @@ const StepCard: React.FC<{
   const handleCardClick = () => {
     if (!isActive && onStepClick) onStepClick(step);
   };
+
+  // U7 focus-mode countdown: render seconds-remaining, not just elapsed. The
+  // operator at the bench cares about "how much longer", so show the bigger
+  // number directly. We compute remaining client-side from the same fields
+  // the swimlane uses (duration - elapsed); the per-second tick in the
+  // Runner already keeps elapsed_seconds advancing for re-render.
+  const secondsRemaining = Math.max(
+    0,
+    (step.duration_seconds || 0) - (step.elapsed_seconds || 0)
+  );
+
+  // ---------------------------------------------------------------------
+  // U7 focus-mode active step: large countdown over a thumb-sized button
+  // group. Inlined here (rather than a separate component) so the swimlane
+  // and focus renders share status / button-visibility logic above without
+  // a second copy. Only the active step in focus mode hits this branch;
+  // everything else falls through to the swimlane-shaped layout below.
+  // ---------------------------------------------------------------------
+  if (isFocus && isActive) {
+    return (
+      <Card
+        sx={{
+          ...cardSx,
+          width: '100%',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <CardContent sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column', gap: 2, py: { xs: 3, sm: 4 } }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 2 }}>
+            <Typography variant="h5" sx={{ fontWeight: 700 }}>
+              {step.name}
+            </Typography>
+            {renderStatusChip(status)}
+          </Box>
+          <Typography variant="body1" color="text.secondary">
+            {formatDurationMinutes(step.duration_seconds)}
+            {step.resource_required ? ` | ${step.resource_required}` : ''}
+          </Typography>
+          {/* Big tabular-nums countdown. h2 + tabular-nums keeps the digit
+              widths stable across the per-second tick so the number doesn't
+              wiggle. We always show the countdown in focus mode -- even for
+              READY steps (where it equals duration_seconds) -- so the
+              operator can see "this step is N min" at a glance before tap. */}
+          <Box
+            sx={{
+              flexGrow: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              py: 2,
+            }}
+          >
+            <Typography
+              variant="h1"
+              sx={{
+                fontVariantNumeric: 'tabular-nums',
+                fontWeight: 300,
+                fontSize: { xs: '5rem', sm: '7rem' },
+                lineHeight: 1,
+              }}
+              aria-label="time remaining"
+            >
+              {formatTime(
+                status === StepStatus.RUNNING || status === StepStatus.PAUSED
+                  ? secondsRemaining
+                  : step.duration_seconds
+              )}
+            </Typography>
+            {status === StepStatus.RUNNING && step.step_type !== StepType.TASK && (
+              <LinearProgress
+                variant="determinate"
+                value={getProgress(step)}
+                sx={{ width: '100%', mt: 2, height: 10, borderRadius: 1 }}
+              />
+            )}
+          </Box>
+        </CardContent>
+        {/* Lower-half button group: full-width, large, thumb-sized. We use
+            ``size="large"`` + a generous Stack gap so a glove or thumb-tap
+            doesn't spill onto the wrong action. The live-edit +/-5m buttons
+            land below the primary group at smaller size since they're
+            secondary actions in the at-the-bench flow. */}
+        <CardActions sx={{ flexDirection: 'column', alignItems: 'stretch', gap: 1.5, px: 2, pb: 3 }}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ width: '100%' }}>
+            {showStartButton && actions.onStartStep && (
+              <Button
+                color="primary"
+                variant="contained"
+                size="large"
+                fullWidth
+                startIcon={<PlayArrowIcon />}
+                onClick={() => actions.onStartStep!(step)}
+                sx={{ py: 2, fontSize: '1.25rem' }}
+              >
+                Start
+              </Button>
+            )}
+            {showPauseButton && actions.onPauseStep && (
+              <Button
+                color="warning"
+                variant="contained"
+                size="large"
+                fullWidth
+                startIcon={<PauseIcon />}
+                onClick={() => actions.onPauseStep!(step)}
+                sx={{ py: 2, fontSize: '1.25rem' }}
+              >
+                Pause
+              </Button>
+            )}
+            {showResumeButton && actions.onResumeStep && (
+              <Button
+                color="primary"
+                variant="contained"
+                size="large"
+                fullWidth
+                startIcon={<PlayArrowIcon />}
+                onClick={() => actions.onResumeStep!(step)}
+                sx={{ py: 2, fontSize: '1.25rem' }}
+              >
+                Resume
+              </Button>
+            )}
+            {showCompleteButton && actions.onCompleteStep && (
+              <Button
+                color="success"
+                variant="contained"
+                size="large"
+                fullWidth
+                startIcon={<CheckIcon />}
+                onClick={() => actions.onCompleteStep!(step)}
+                sx={{ py: 2, fontSize: '1.25rem' }}
+              >
+                Complete
+              </Button>
+            )}
+            {showSkipButton && actions.onSkipStep && (
+              <Button
+                color="error"
+                variant="outlined"
+                size="large"
+                fullWidth
+                startIcon={<SkipNextIcon />}
+                onClick={() => actions.onSkipStep!(step)}
+                sx={{ py: 2, fontSize: '1.1rem' }}
+              >
+                Skip
+              </Button>
+            )}
+          </Stack>
+          {showLiveEdit && actions.onExtendStep && (
+            <ButtonGroup
+              size="medium"
+              variant="outlined"
+              fullWidth
+              aria-label="adjust step duration"
+            >
+              <Button onClick={() => actions.onExtendStep!(step, -300)} aria-label="shrink five minutes">
+                -5m
+              </Button>
+              <Button onClick={() => actions.onExtendStep!(step, -60)} aria-label="shrink one minute">
+                -1m
+              </Button>
+              <Button onClick={() => actions.onExtendStep!(step, 60)} aria-label="extend one minute">
+                +1m
+              </Button>
+              <Button onClick={() => actions.onExtendStep!(step, 300)} aria-label="extend five minutes">
+                +5m
+              </Button>
+            </ButtonGroup>
+          )}
+        </CardActions>
+      </Card>
+    );
+  }
 
   return (
     <Card
@@ -364,6 +552,8 @@ const ConditionLane: React.FC<ConditionLaneProps> = ({
   onPushCondition,
   onStepClick,
   variant = 'swimlane',
+  hideNonActiveSteps = false,
+  hideHeader = false,
   onStartStep,
   onPauseStep,
   onResumeStep,
@@ -428,41 +618,68 @@ const ConditionLane: React.FC<ConditionLaneProps> = ({
     </ButtonGroup>
   );
 
+  // U7: when hideNonActiveSteps is set (focus mode), narrow the rendered
+  // step list to just the active step. If no step is currently active in
+  // this Condition, fall back to whatever step is READY next so the
+  // operator can still see + tap Start; only when nothing is actionable do
+  // we render the empty state. The caller is the source of truth for
+  // ``activeStepId`` -- we never re-derive it here.
+  const visibleSteps = hideNonActiveSteps
+    ? (() => {
+        const active = steps.find((s) => s.id === activeStepId);
+        if (active) return [active];
+        const ready = steps.find((s) => s.status === StepStatus.READY);
+        return ready ? [ready] : [];
+      })()
+    : steps;
+
   return (
     <Paper
       // Outer Paper holds the lane background wash. We rely on the body's
       // own elevated cards to provide contrast against this tint.
-      sx={{ overflow: 'hidden', bgcolor: laneBg }}
+      // In focus mode the surrounding navigator already paints a header
+      // strip in the same palette color, so we drop the inner wash to a
+      // transparent fill so the two strips don't double up.
+      sx={{
+        overflow: 'hidden',
+        bgcolor: hideHeader ? 'transparent' : laneBg,
+        boxShadow: hideHeader ? 'none' : undefined,
+      }}
       aria-label={`${condition.name} lane`}
     >
       {/* Lane header. Saturated palette color, condition name + soft step
-          count chip, optional push controls aligned to the right. */}
-      <Box
-        sx={{
-          bgcolor: palette.bg,
-          color: palette.fg,
-          px: 2,
-          py: 1,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 1,
-        }}
-      >
-        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-          {condition.name || '(unnamed)'}
-        </Typography>
-        <Typography variant="caption" sx={{ opacity: 0.85 }}>
-          ({steps.length} step{steps.length === 1 ? '' : 's'})
-        </Typography>
-        {headerControls}
-      </Box>
+          count chip, optional push controls aligned to the right. Hidden
+          in focus mode -- FocusModeRunner paints its own equivalent. */}
+      {!hideHeader && (
+        <Box
+          sx={{
+            bgcolor: palette.bg,
+            color: palette.fg,
+            px: 2,
+            py: 1,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1,
+          }}
+        >
+          <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+            {condition.name || '(unnamed)'}
+          </Typography>
+          <Typography variant="caption" sx={{ opacity: 0.85 }}>
+            ({steps.length} step{steps.length === 1 ? '' : 's'})
+          </Typography>
+          {headerControls}
+        </Box>
+      )}
       {/* Lane body. Empty state is explicit so the user can tell a Condition
           exists even when it has zero steps (e.g., mid-design between the
           Conditions sidebar add and the first Step assignment). */}
-      <Box sx={{ px: 2, py: 2 }}>
-        {steps.length === 0 ? (
+      <Box sx={{ px: hideHeader ? 0 : 2, py: hideHeader ? 0 : 2 }}>
+        {visibleSteps.length === 0 ? (
           <Alert severity="info" variant="outlined">
-            No steps in this Condition.
+            {steps.length === 0
+              ? 'No steps in this Condition.'
+              : 'All steps in this Condition are complete.'}
           </Alert>
         ) : (
           <Stack
@@ -471,7 +688,7 @@ const ConditionLane: React.FC<ConditionLaneProps> = ({
             useFlexGap
             flexWrap="wrap"
           >
-            {steps.map((step) => (
+            {visibleSteps.map((step) => (
               <StepCard
                 key={step.id}
                 step={step}
